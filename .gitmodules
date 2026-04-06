@@ -1,0 +1,3 @@
+[submodule "miniprot"]
+	path = miniprot
+	url = https://github.com/lh3/miniprot
