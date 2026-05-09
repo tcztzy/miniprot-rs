@@ -245,12 +245,11 @@ pub fn select_sub(pri_ratio: f32, min_diff: i32, best_n: i32, regs: &mut Vec<Ali
             keep_indices.push(i);
             continue;
         };
-        let parent = &regs[p];
         if p == i {
             keep_indices.push(i);
             continue;
         }
-
+        let parent = &regs[p];
         let identical = reg.qs == parent.qs
             && reg.qe == parent.qe
             && reg.vid == parent.vid
@@ -259,7 +258,6 @@ pub fn select_sub(pri_ratio: f32, min_diff: i32, best_n: i32, regs: &mut Vec<Ali
         if identical || n_2nd >= best_n {
             continue;
         }
-
         let sci = reg.score();
         let scp = parent.score();
         let keep = sci as f32 >= scp as f32 * pri_ratio
@@ -274,11 +272,10 @@ pub fn select_sub(pri_ratio: f32, min_diff: i32, best_n: i32, regs: &mut Vec<Ali
         }
     }
     if keep_indices.len() != orig_len {
-        let kept: Vec<_> = keep_indices
-            .iter()
-            .map(|&i| std::mem::take(&mut regs[i]))
+        *regs = keep_indices
+            .into_iter()
+            .map(|i| std::mem::take(&mut regs[i]))
             .collect();
-        *regs = kept;
         sync_regs(regs);
     }
 }

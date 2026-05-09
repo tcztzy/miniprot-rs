@@ -241,6 +241,7 @@ fn compute_sc(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[must_use]
 pub fn chain(
     mut max_dist_x: i32,
     mut max_dist_y: i32,

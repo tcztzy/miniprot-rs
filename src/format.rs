@@ -39,21 +39,21 @@ fn q_aa(tables: &Tables, aa: u8) -> u8 {
     }
 }
 
-fn lower_nt(nt: u8) -> char {
+const fn lower_nt(nt: u8) -> char {
     NT_I2C[nt as usize].to_ascii_lowercase() as char
 }
 
-fn upper_aa(aa: u8) -> char {
+const fn upper_aa(aa: u8) -> char {
     (aa as char).to_ascii_uppercase()
 }
 
 #[inline]
-fn strand_char(vid: VirtualId) -> char {
+const fn strand_char(vid: VirtualId) -> char {
     if vid.is_rev() { '-' } else { '+' }
 }
 
 #[inline]
-fn project_range(vid: VirtualId, ctg_len: i64, vs: i64, ve: i64) -> (i64, i64) {
+const fn project_range(vid: VirtualId, ctg_len: i64, vs: i64, ve: i64) -> (i64, i64) {
     if vid.is_rev() {
         (ctg_len - ve, ctg_len - vs)
     } else {
@@ -70,10 +70,10 @@ fn push_upper_aas(out: &mut String, aas: &[u8]) {
 }
 
 #[inline]
-fn match_marker(opt: &MapOptions, nt_aa: u8, aa_aa: u8) -> char {
+const fn match_marker(mat: &[[i8; 22]; 22], nt_aa: u8, aa_aa: u8) -> char {
     if nt_aa == aa_aa {
         '|'
-    } else if opt.mat[nt_aa as usize][aa_aa as usize] > 0 {
+    } else if mat[nt_aa as usize][aa_aa as usize] > 0 {
         '+'
     } else {
         ' '
@@ -254,7 +254,7 @@ fn write_residue(out: &mut String, mi: &Index, opt: &MapOptions, aa: &[u8], reg:
                     let nt_char = AA_I2C[nt_aa as usize] as char;
                     push_padded3(&mut ata, nt_char, '.');
                     sta.push(nt_char);
-                    push_padded3(&mut aas, match_marker(opt, nt_aa, aa_aa), ' ');
+                    push_padded3(&mut aas, match_marker(&opt.mat, nt_aa, aa_aa), ' ');
                     push_padded3(&mut aqa, upper_aa(aa[aa_idx]), ' ');
                 }
                 nt_offset += len3;
@@ -318,7 +318,7 @@ fn write_residue(out: &mut String, mi: &Index, opt: &MapOptions, aa: &[u8], reg:
                     let nt_char = AA_I2C[nt_aa as usize] as char;
                     atn.push(NT_I2C[nt[nt_offset] as usize] as char);
                     ata.push(nt_char);
-                    aas.push(match_marker(opt, nt_aa, aa_aa));
+                    aas.push(match_marker(&opt.mat, nt_aa, aa_aa));
                     aqa.push(upper_aa(aa[aa_offset]));
                     sta.push(nt_char);
                     nt_offset += 1;

@@ -38,11 +38,13 @@ pub struct Anchor(u64);
 
 impl Anchor {
     #[inline(always)]
+    #[must_use]
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
     #[inline(always)]
+    #[must_use]
     pub const fn from_parts(target: i32, query: i32) -> Self {
         Self(pack64(target, query))
     }
@@ -90,6 +92,7 @@ impl From<u64> for Anchor {
 }
 
 impl From<Anchor> for u64 {
+    #[inline]
     fn from(value: Anchor) -> Self {
         value.raw()
     }
@@ -103,6 +106,7 @@ pub struct ChainMeta {
 
 impl ChainMeta {
     #[inline(always)]
+    #[must_use]
     pub const fn new(score: i32, len: usize) -> Self {
         Self { score, len }
     }
@@ -116,6 +120,7 @@ pub struct Extents {
 
 impl Extents {
     #[inline(always)]
+    #[must_use]
     pub const fn new(left: i32, right: i32) -> Self {
         Self { left, right }
     }
@@ -127,6 +132,7 @@ pub struct ContigId(pub usize);
 
 impl ContigId {
     #[inline(always)]
+    #[must_use]
     pub const fn new(index: usize) -> Self {
         Self(index)
     }
@@ -145,11 +151,13 @@ pub struct VirtualId {
 
 impl VirtualId {
     #[inline(always)]
+    #[must_use]
     pub const fn forward(contig: ContigId) -> Self {
         Self { contig, rev: false }
     }
 
     #[inline(always)]
+    #[must_use]
     pub const fn reverse(contig: ContigId) -> Self {
         Self { contig, rev: true }
     }
@@ -268,6 +276,13 @@ impl Alignment {
             .as_ref()
             .map_or(self.chn_sc, |extra| extra.dp_max)
     }
+
+    /// Invalidate this alignment so it will be filtered out downstream.
+    #[inline]
+    pub fn invalidate(&mut self) {
+        self.cnt = 0;
+        self.anchors.clear();
+    }
 }
 
 #[repr(C)]
@@ -297,10 +312,12 @@ impl IndexOptions {
         }
     }
 
+    #[must_use]
     pub fn n_bucket(&self) -> usize {
         1usize << (self.kmer as usize * MP_BITS_PER_AA - self.mod_bit as usize)
     }
 
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         IntoBytes::as_bytes(self)
     }

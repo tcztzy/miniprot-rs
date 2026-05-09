@@ -90,7 +90,7 @@ impl CigarBuilder {
     }
 }
 
-fn nt_code(tables: &Tables, byte: u8) -> u8 {
+const fn nt_code(tables: &Tables, byte: u8) -> u8 {
     if byte < 5 {
         byte
     } else {
@@ -98,7 +98,7 @@ fn nt_code(tables: &Tables, byte: u8) -> u8 {
     }
 }
 
-fn aa_code(tables: &Tables, byte: u8) -> u8 {
+const fn aa_code(tables: &Tables, byte: u8) -> u8 {
     if byte < AA_I2C.len() as u8 {
         byte
     } else {
@@ -107,7 +107,7 @@ fn aa_code(tables: &Tables, byte: u8) -> u8 {
 }
 
 #[inline]
-fn codon_aa(tables: &Tables, n1: u8, n2: u8, n3: u8) -> u8 {
+const fn codon_aa(tables: &Tables, n1: u8, n2: u8, n3: u8) -> u8 {
     if n1 > 3 || n2 > 3 || n3 > 3 {
         AA_AMBI
     } else {
@@ -116,7 +116,7 @@ fn codon_aa(tables: &Tables, n1: u8, n2: u8, n3: u8) -> u8 {
 }
 
 #[inline]
-fn slice_codon_aa(tables: &Tables, nt: &[u8], i: usize) -> u8 {
+const fn slice_codon_aa(tables: &Tables, nt: &[u8], i: usize) -> u8 {
     codon_aa(tables, nt[i], nt[i + 1], nt[i + 2])
 }
 
@@ -330,11 +330,11 @@ fn prep_seq_left(ns: &[u8], aa: &[u8], opt: &NsOpt<'_>, ss: Option<&[u8]>) -> Pr
     }
 }
 
-fn score_pair(opt: &NsOpt<'_>, nt_aa: u8, aa_aa: u8) -> i32 {
-    opt.sc[nt_aa as usize][aa_aa as usize] as i32
+const fn score_pair(sc: &[[i8; 22]; 22], nt_aa: u8, aa_aa: u8) -> i32 {
+    sc[nt_aa as usize][aa_aa as usize] as i32
 }
 
-fn encode_trace(state: u8, i_ext: bool, d_ext: bool, a_ext: bool, b_ext: bool, c_ext: bool) -> u16 {
+const fn encode_trace(state: u8, i_ext: bool, d_ext: bool, a_ext: bool, b_ext: bool, c_ext: bool) -> u16 {
     (state as u16)
         | ((i_ext as u16) << 4)
         | ((d_ext as u16) << 5)
@@ -343,7 +343,7 @@ fn encode_trace(state: u8, i_ext: bool, d_ext: bool, a_ext: bool, b_ext: bool, c
         | ((c_ext as u16) << 8)
 }
 
-fn trace_ext(x: u16, state: u8) -> bool {
+const fn trace_ext(x: u16, state: u8) -> bool {
     match state {
         1 => ((x >> 4) & 1) != 0,
         2 => ((x >> 5) & 1) != 0,
@@ -465,6 +465,13 @@ fn scalar_dp(ns: &[u8], aa: &[u8], opt: &NsOpt<'_>, ss: Option<&[u8]>) -> NsResu
         return NsResult::default();
     }
 
+    // Two-tier DP: detect if any splice signal exists in this segment.
+    // When absent, states 3-9 are guaranteed suboptimal and can be skipped,
+    // saving ~70% of inner-loop operations.
+    let sp_default = opt.sp[3];
+    let has_splice = prep.donor[..nl].iter().any(|&d| d != sp_default)
+        || prep.acceptor[..nl].iter().any(|&a| a != sp_default);
+
     let mut h_prev3 = vec![NEG_INF; al + 1];
     let mut h_prev2 = vec![NEG_INF; al + 1];
     let mut h_prev1 = vec![NEG_INF; al + 1];
@@ -473,12 +480,12 @@ fn scalar_dp(ns: &[u8], aa: &[u8], opt: &NsOpt<'_>, ss: Option<&[u8]>) -> NsResu
     let mut d_prev2 = vec![NEG_INF; al + 1];
     let mut d_prev1 = vec![NEG_INF; al + 1];
     let mut d_cur = vec![NEG_INF; al + 1];
-    let mut a_prev1 = vec![NEG_INF; al + 1];
-    let mut b_prev1 = vec![NEG_INF; al + 1];
-    let mut c_prev1 = vec![NEG_INF; al + 1];
-    let mut a_cur = vec![NEG_INF; al + 1];
-    let mut b_cur = vec![NEG_INF; al + 1];
-    let mut c_cur = vec![NEG_INF; al + 1];
+    let mut a_prev1 = if has_splice { vec![NEG_INF; al + 1] } else { Vec::new() };
+    let mut b_prev1 = if has_splice { vec![NEG_INF; al + 1] } else { Vec::new() };
+    let mut c_prev1 = if has_splice { vec![NEG_INF; al + 1] } else { Vec::new() };
+    let mut a_cur = if has_splice { vec![NEG_INF; al + 1] } else { Vec::new() };
+    let mut b_cur = if has_splice { vec![NEG_INF; al + 1] } else { Vec::new() };
+    let mut c_cur = if has_splice { vec![NEG_INF; al + 1] } else { Vec::new() };
 
     h_prev3[0] = 0;
     h_prev2[0] = -opt.fs;
@@ -497,9 +504,11 @@ fn scalar_dp(ns: &[u8], aa: &[u8], opt: &NsOpt<'_>, ss: Option<&[u8]>) -> NsResu
     for i in 2..nl {
         h_cur.fill(NEG_INF);
         d_cur.fill(NEG_INF);
-        a_cur.fill(NEG_INF);
-        b_cur.fill(NEG_INF);
-        c_cur.fill(NEG_INF);
+        if has_splice {
+            a_cur.fill(NEG_INF);
+            b_cur.fill(NEG_INF);
+            c_cur.fill(NEG_INF);
+        }
 
         let gei = if prep.nas[i] == AA_STOP {
             opt.fs
@@ -523,7 +532,7 @@ fn scalar_dp(ns: &[u8], aa: &[u8], opt: &NsOpt<'_>, ss: Option<&[u8]>) -> NsResu
         let mut row_max = NEG_INF;
         for j in 0..al {
             let col = j + 1;
-            let mut best = h_prev3[j] + score_pair(opt, prep.nas[i], prep.aas[j]);
+            let mut best = h_prev3[j] + score_pair(opt.sc, prep.nas[i], prep.aas[j]);
             let mut state = 0u8;
 
             let open_i = h_cur[j] - opt.go;
@@ -546,58 +555,64 @@ fn scalar_dp(ns: &[u8], aa: &[u8], opt: &NsOpt<'_>, ss: Option<&[u8]>) -> NsResu
                 state = 2;
             }
 
-            let open_a = h_prev1[col] - opt.io - dim1;
-            let ext_a = a_prev1[col];
-            t = open_a.max(ext_a);
-            let a_ext = ext_a > open_a;
-            a_cur[col] = t;
-            let ta = t - ai;
-            if ta > best {
-                best = ta;
-                state = 3;
-            }
+            let mut a_ext = false;
+            let mut b_ext = false;
+            let mut c_ext = false;
 
-            let open_b = h_prev1[j] - opt.io - di;
-            let ext_b = b_prev1[col];
-            t = open_b.max(ext_b);
-            let b_ext = ext_b > open_b;
-            b_cur[col] = t;
-            let tb = t - aim2;
-            if tb > best {
-                best = tb;
-                state = 4;
-            }
+            if has_splice {
+                let open_a = h_prev1[col] - opt.io - dim1;
+                let ext_a = a_prev1[col];
+                t = open_a.max(ext_a);
+                a_ext = ext_a > open_a;
+                a_cur[col] = t;
+                let ta = t - ai;
+                if ta > best {
+                    best = ta;
+                    state = 3;
+                }
 
-            let open_c = h_prev1[j] - opt.io - dip1;
-            let ext_c = c_prev1[col];
-            t = open_c.max(ext_c);
-            let c_ext = ext_c > open_c;
-            c_cur[col] = t;
-            let tc = t - aim1;
-            if tc > best {
-                best = tc;
-                state = 5;
-            }
+                let open_b = h_prev1[j] - opt.io - di;
+                let ext_b = b_prev1[col];
+                t = open_b.max(ext_b);
+                b_ext = ext_b > open_b;
+                b_cur[col] = t;
+                let tb = t - aim2;
+                if tb > best {
+                    best = tb;
+                    state = 4;
+                }
 
-            t = h_prev1[j] - opt.fs;
-            if t > best {
-                best = t;
-                state = 6;
-            }
-            t = h_prev2[j] - opt.fs;
-            if t > best {
-                best = t;
-                state = 7;
-            }
-            t = h_prev1[col] - opt.fs;
-            if t > best {
-                best = t;
-                state = 8;
-            }
-            t = h_prev2[col] - opt.fs;
-            if t > best {
-                best = t;
-                state = 9;
+                let open_c = h_prev1[j] - opt.io - dip1;
+                let ext_c = c_prev1[col];
+                t = open_c.max(ext_c);
+                c_ext = ext_c > open_c;
+                c_cur[col] = t;
+                let tc = t - aim1;
+                if tc > best {
+                    best = tc;
+                    state = 5;
+                }
+
+                t = h_prev1[j] - opt.fs;
+                if t > best {
+                    best = t;
+                    state = 6;
+                }
+                t = h_prev2[j] - opt.fs;
+                if t > best {
+                    best = t;
+                    state = 7;
+                }
+                t = h_prev1[col] - opt.fs;
+                if t > best {
+                    best = t;
+                    state = 8;
+                }
+                t = h_prev2[col] - opt.fs;
+                if t > best {
+                    best = t;
+                    state = 9;
+                }
             }
 
             h_cur[col] = best;
@@ -638,9 +653,11 @@ fn scalar_dp(ns: &[u8], aa: &[u8], opt: &NsOpt<'_>, ss: Option<&[u8]>) -> NsResu
         std::mem::swap(&mut d_prev3, &mut d_prev2);
         std::mem::swap(&mut d_prev2, &mut d_prev1);
         std::mem::swap(&mut d_prev1, &mut d_cur);
-        std::mem::swap(&mut a_prev1, &mut a_cur);
-        std::mem::swap(&mut b_prev1, &mut b_cur);
-        std::mem::swap(&mut c_prev1, &mut c_cur);
+        if has_splice {
+            std::mem::swap(&mut a_prev1, &mut a_cur);
+            std::mem::swap(&mut b_prev1, &mut b_cur);
+            std::mem::swap(&mut c_prev1, &mut c_cur);
+        }
     }
 
     if (opt.flag & (NS_F_EXT_LEFT | NS_F_EXT_RIGHT)) != 0 {
@@ -844,7 +861,7 @@ fn extra_cal(
                 {
                     let nt_aa = codon_aa(tables, codon_nt[0], codon_nt[1], codon_nt[2]);
                     let aa_aa = aa_code(tables, aa_byte);
-                    let s = score_pair(&ns_opt, nt_aa, aa_aa);
+                    let s = score_pair(ns_opt.sc, nt_aa, aa_aa);
                     extra.n_stop += (nt_aa == AA_STOP) as i32;
                     extra.n_iden += (nt_aa == aa_aa) as i32;
                     extra.n_plus += (s > 0) as i32;
@@ -889,7 +906,7 @@ fn extra_cal(
                         codon_aa(tables, nt[nl], nt[nl + 1], nt[nl + len - 1])
                     };
                     let aa_aa = aa_code(tables, aa[al]);
-                    let s = score_pair(&ns_opt, nt_aa, aa_aa);
+                    let s = score_pair(ns_opt.sc, nt_aa, aa_aa);
                     extra.n_stop += (nt_aa == AA_STOP) as i32;
                     extra.n_iden += (nt_aa == aa_aa) as i32;
                     extra.n_plus += (s > 0) as i32;
@@ -1030,7 +1047,7 @@ pub fn align_reg(
     extr0: i32,
 ) {
     if reg.cnt == 0 || reg.anchors.is_empty() {
-        reg.cnt = 0;
+        reg.invalidate();
         return;
     }
 
@@ -1040,7 +1057,7 @@ pub fn align_reg(
         .iter()
         .position(|anchor| anchor.has_query_flag())
     else {
-        reg.cnt = 0;
+        reg.invalidate();
         return;
     };
 
@@ -1068,21 +1085,21 @@ pub fn align_reg(
     let ae = (reg.ve + extr as i64).min(ctg_len);
     let mut nt = vec![0u8; (ae - as_) as usize];
     let Ok(l_nt) = mi.nt.get_by_v(reg.vid, as_, ae, &mut nt) else {
-        reg.cnt = 0;
+        reg.invalidate();
         return;
     };
     if l_nt != ae - as_ {
-        reg.cnt = 0;
+        reg.invalidate();
         return;
     }
     let ss_buf = if mi.nt.has_spsc() {
         let mut ss = vec![0u8; (ae - as_) as usize];
         let Ok(l_ss) = mi.nt.spsc_get_by_v(reg.vid, as_, ae, &mut ss) else {
-            reg.cnt = 0;
+            reg.invalidate();
             return;
         };
         if l_ss != l_nt {
-            reg.cnt = 0;
+            reg.invalidate();
             return;
         }
         Some(ss)
@@ -1222,6 +1239,6 @@ pub fn align_reg(
         &aa[reg.qs as usize..],
         qlen,
     ) {
-        reg.cnt = 0;
+        reg.invalidate();
     }
 }

@@ -75,14 +75,12 @@ fn refine_reg(
     let target_start = reg.vs.saturating_sub(left_ext as i64).min(ctg_len).max(0);
     let target_end = (reg.ve + right_ext as i64).min(ctg_len).max(0);
     if target_start >= target_end {
-        reg.cnt = 0;
-        reg.anchors.clear();
+        reg.invalidate();
         return;
     }
     let mut nt = vec![0u8; (target_end - target_start) as usize];
     let Ok(nt_len) = mi.nt.get_by_v(reg.vid, target_start, target_end, &mut nt) else {
-        reg.cnt = 0;
-        reg.anchors.clear();
+        reg.invalidate();
         return;
     };
     let nt_sketches = sketch_nt4(&mi.tables, &nt, nt_len, io.min_aa_len, kmer, 0, 0, 0);
@@ -126,8 +124,7 @@ fn refine_reg(
         0,
         anchors,
     ) else {
-        reg.cnt = 0;
-        reg.anchors.clear();
+        reg.invalidate();
         return;
     };
 
