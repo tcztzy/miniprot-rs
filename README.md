@@ -39,21 +39,22 @@ genome GRCh38.p14 (`GCF_000001405.40`, 928 MB gzipped FASTA). Both binaries
 compiled with arch-native flags (`-C target-cpu=native` / `-march=native
 -mtune=native`). 200 protein queries derived from chromosome 1 ORFs.
 
-### aarch64 (Apple M-series, 4 threads)
+### aarch64 (Apple M2, 4 threads)
 
 | Phase            | C oracle | Rust     | Rust vs C    |
 |------------------|---------:|---------:|-------------:|
 | Index build      | 5m00s    | **3m27s** | **31% faster** |
-| Map (1t, CPU)    | 6.26s    | **5.28s** | **15.7% faster** |
-| Map (4t, CPU)    | 8.92s    | **7.65s** | **14.2% faster** |
+| Map (1t, CPU)    | 6.26s    | **5.23s** | **16.5% faster** |
+| Map (4t, CPU)    | 8.92s    | **6.10s** | **31.6% faster** |
 
 ### x86_64 (Intel Xeon Gold 5320, Ice Lake, 4 threads)
 
 | Phase            | C oracle | Rust     | Rust vs C    |
 |------------------|---------:|---------:|-------------:|
 | Index build      | 78.3s    | **40.5s** | **48% faster** |
-| Map (1t, CPU)    | 19.26s   | **18.05s** | **6.3% faster** |
-| Map (4t, CPU)    | 19.24s   | **18.09s** | **6.1% faster** |
+| Map (1t, user)   | 23.01s   | **22.82s** | **0.8% faster** |
+| Map (1t, total)  | 27.14s   | **25.96s** | **4.4% faster** |
+| Map (4t, total)  | 8.78s    | **8.52s**  | **3.0% faster** |
 
 ### What makes it fast
 
@@ -71,6 +72,9 @@ compiled with arch-native flags (`-C target-cpu=native` / `-march=native
   comparison sort for the typical input sizes.
 - **Rayon parallelism** — work-stealing thread pool for both index building
   and per-query mapping.
+- **Thread-local buffer reuse** — profile matrix and SIMD scratch arrays
+  reused across DP calls via thread-local storage, cutting ~1 GB of temporary
+  allocations per benchmark run.
 
 Reproduce with:
 

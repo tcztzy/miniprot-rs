@@ -337,14 +337,15 @@ mod x86_64 {
         log_2
     }
 
-    unsafe fn gen_profile(
+    unsafe fn gen_profile_into(
         aas: &[u8],
         al: usize,
         slen: usize,
         sc: &[[i8; 22]; 22],
-    ) -> Vec<__m128i> {
+        profile: &mut [__m128i],
+    ) {
         let neg = unsafe { set1(NEG) };
-        let mut profile = vec![neg; 22 * slen];
+        profile.fill(neg);
         for (a, row) in sc.iter().enumerate() {
             for j in 0..slen {
                 let mut lanes = [NEG; LANES];
@@ -357,7 +358,6 @@ mod x86_64 {
                 profile[a * slen + j] = unsafe { load_lanes(lanes) };
             }
         }
-        profile
     }
 
     fn fix_tiny_uv(cigar: &mut [u32]) {
@@ -477,6 +477,12 @@ mod x86_64 {
         unsafe { global_gs16b_inner(ns, aa, opt, ss) }
     }
 
+    // Thread-local profile buffer reused across DP calls.
+    thread_local! {
+        static PROFILE_BUF: std::cell::UnsafeCell<Vec<__m128i>> =
+            std::cell::UnsafeCell::new(Vec::new());
+    }
+
     unsafe fn global_gs16b_inner(
         ns: &[u8],
         aa: &[u8],
@@ -500,7 +506,17 @@ mod x86_64 {
         let goe = unsafe { set1((opt.go + opt.ge) as i16) };
         let io = unsafe { set1(opt.io as i16) };
         let fs = unsafe { set1(opt.fs as i16) };
-        let profile = unsafe { gen_profile(&prep.aas, al, slen, opt.sc) };
+
+        // Reuse thread-local profile buffer to avoid reallocation.
+        let profile = PROFILE_BUF.with(|cell| {
+            let buf = unsafe { &mut *cell.get() };
+            let needed = 22 * slen;
+            if buf.len() < needed {
+                buf.resize(needed, neg);
+            }
+            unsafe { gen_profile_into(&prep.aas, al, slen, opt.sc, &mut buf[..needed]) };
+            &buf[..needed]
+        });
 
         let mut h = vec![neg; slen + 1];
         let mut h1 = vec![neg; slen + 1];
