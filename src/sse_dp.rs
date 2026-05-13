@@ -1,6 +1,6 @@
-#[cfg(target_arch = "aarch64")]
-mod aarch64 {
-    use std::arch::aarch64::*;
+#[cfg(target_arch = "x86_64")]
+mod x86_64 {
+    use std::arch::x86_64::*;
 
     use crate::align::{AA_STOP, NsOpt, NsResult, acceptor_poly_y_penalty};
     use crate::tables::{
@@ -261,69 +261,69 @@ mod aarch64 {
     }
 
     #[inline(always)]
-    unsafe fn set1(x: i16) -> int16x8_t {
-        unsafe { vdupq_n_s16(x) }
+    unsafe fn set1(x: i16) -> __m128i {
+        unsafe { _mm_set1_epi16(x) }
     }
 
     #[inline(always)]
-    unsafe fn set_lane0(v: int16x8_t, x: i16) -> int16x8_t {
-        unsafe { vsetq_lane_s16::<0>(x, v) }
+    unsafe fn set_lane0(v: __m128i, x: i16) -> __m128i {
+        unsafe { _mm_insert_epi16::<0>(v, x as i32) }
     }
 
     #[inline(always)]
-    unsafe fn shift_left_2(v: int16x8_t) -> int16x8_t {
-        unsafe { vreinterpretq_s16_u8(vextq_u8::<14>(vdupq_n_u8(0), vreinterpretq_u8_s16(v))) }
+    unsafe fn shift_left_2(v: __m128i) -> __m128i {
+        unsafe { _mm_slli_si128(v, 2) }
     }
 
     #[inline(always)]
-    unsafe fn v_or(a: int16x8_t, b: int16x8_t) -> int16x8_t {
-        unsafe {
-            vreinterpretq_s16_u16(vorrq_u16(
-                vreinterpretq_u16_s16(a),
-                vreinterpretq_u16_s16(b),
-            ))
-        }
+    unsafe fn v_or(a: __m128i, b: __m128i) -> __m128i {
+        unsafe { _mm_or_si128(a, b) }
     }
 
     #[inline(always)]
-    unsafe fn v_and(a: int16x8_t, b: int16x8_t) -> int16x8_t {
-        unsafe {
-            vreinterpretq_s16_u16(vandq_u16(
-                vreinterpretq_u16_s16(a),
-                vreinterpretq_u16_s16(b),
-            ))
-        }
+    unsafe fn v_and(a: __m128i, b: __m128i) -> __m128i {
+        unsafe { _mm_and_si128(a, b) }
     }
 
     #[inline(always)]
-    unsafe fn cmpgt(a: int16x8_t, b: int16x8_t) -> int16x8_t {
-        unsafe { vreinterpretq_s16_u16(vcgtq_s16(a, b)) }
+    unsafe fn cmpgt(a: __m128i, b: __m128i) -> __m128i {
+        unsafe { _mm_cmpgt_epi16(a, b) }
+    }
+
+    /// SSE blendv: result = (mask & a) | (~mask & b), takes high bit of each byte in mask.
+    /// Equivalent to NEON vbslq_s16(mask, a, b).
+    #[inline(always)]
+    unsafe fn select(mask: __m128i, a: __m128i, b: __m128i) -> __m128i {
+        unsafe { _mm_blendv_epi8(b, a, mask) }
     }
 
     #[inline(always)]
-    unsafe fn select(cond: int16x8_t, a: int16x8_t, b: int16x8_t) -> int16x8_t {
-        unsafe { vbslq_s16(vreinterpretq_u16_s16(cond), a, b) }
+    unsafe fn all_le(a: __m128i, b: __m128i) -> bool {
+        let cmp = unsafe { _mm_cmpgt_epi16(a, b) };
+        unsafe { _mm_testz_si128(cmp, cmp) != 0 }
     }
 
     #[inline(always)]
-    unsafe fn all_le(a: int16x8_t, b: int16x8_t) -> bool {
-        unsafe { vmaxvq_u16(vcgtq_s16(a, b)) == 0 }
-    }
-
-    #[inline(always)]
-    unsafe fn extract(v: int16x8_t, lane: usize) -> i16 {
+    unsafe fn extract(v: __m128i, lane: usize) -> i16 {
         let lanes: [i16; LANES] = unsafe { std::mem::transmute(v) };
         lanes[lane]
     }
 
     #[inline(always)]
-    unsafe fn load_lanes(lanes: [i16; LANES]) -> int16x8_t {
-        unsafe { vld1q_s16(lanes.as_ptr()) }
+    unsafe fn load_lanes(lanes: [i16; LANES]) -> __m128i {
+        unsafe { _mm_loadu_si128(lanes.as_ptr() as *const __m128i) }
     }
 
     #[inline(always)]
-    unsafe fn max_lane(v: int16x8_t) -> i32 {
-        unsafe { vmaxvq_s16(v) as i32 }
+    unsafe fn max_lane(v: __m128i) -> i32 {
+        unsafe {
+            let v = _mm_max_epi16(v, _mm_srli_si128(v, 8));
+            let v = _mm_max_epi16(v, _mm_srli_si128(v, 4));
+            let v = _mm_max_epi16(v, _mm_srli_si128(v, 2));
+            // _mm_extract_epi16 zero-extends; sign-extend manually.
+            let raw = _mm_extract_epi16::<0>(v) as u16;
+            (raw as i16) as i32
+        }
     }
 
     #[inline(always)]
@@ -342,7 +342,7 @@ mod aarch64 {
         al: usize,
         slen: usize,
         sc: &[[i8; 22]; 22],
-    ) -> Vec<int16x8_t> {
+    ) -> Vec<__m128i> {
         let neg = unsafe { set1(NEG) };
         let mut profile = vec![neg; 22 * slen];
         for (a, row) in sc.iter().enumerate() {
@@ -371,7 +371,7 @@ mod aarch64 {
         }
     }
 
-    unsafe fn backtrack(tb: &[int16x8_t], nl: i32, al: i32, slen: usize) -> Vec<u32> {
+    unsafe fn backtrack(tb: &[__m128i], nl: i32, al: i32, slen: usize) -> Vec<u32> {
         let mut i = nl - 1;
         let mut j = al - 1;
         let mut last = 0i32;
@@ -461,7 +461,7 @@ mod aarch64 {
     }
 
     #[inline(always)]
-    unsafe fn update_boundary(row: &mut [int16x8_t], slen: usize) {
+    unsafe fn update_boundary(row: &mut [__m128i], slen: usize) {
         row[0] = unsafe { set_lane0(shift_left_2(row[slen]), NEG) };
     }
 
@@ -553,63 +553,63 @@ mod aarch64 {
             if !need_trace {
                 let mut row_max = neg;
                 for j in 0..slen {
-                    let mut h_vec = unsafe { vqaddq_s16(h3[j], s[j]) };
+                    let mut h_vec = unsafe { _mm_adds_epi16(h3[j], s[j]) };
 
-                    let mut t = unsafe { vqsubq_s16(last_h, go) };
-                    t = unsafe { vmaxq_s16(t, i_state) };
-                    i_state = unsafe { vqsubq_s16(t, ge) };
-                    h_vec = unsafe { vmaxq_s16(h_vec, i_state) };
+                    let mut t = unsafe { _mm_subs_epi16(last_h, go) };
+                    t = unsafe { _mm_max_epi16(t, i_state) };
+                    i_state = unsafe { _mm_subs_epi16(t, ge) };
+                    h_vec = unsafe { _mm_max_epi16(h_vec, i_state) };
 
-                    let u = unsafe { vqsubq_s16(h3[j + 1], go) };
-                    t = unsafe { vmaxq_s16(u, d3[j]) };
-                    t = unsafe { vqsubq_s16(t, gei) };
+                    let u = unsafe { _mm_subs_epi16(h3[j + 1], go) };
+                    t = unsafe { _mm_max_epi16(u, d3[j]) };
+                    t = unsafe { _mm_subs_epi16(t, gei) };
                     d[j] = t;
-                    h_vec = unsafe { vmaxq_s16(h_vec, t) };
+                    h_vec = unsafe { _mm_max_epi16(h_vec, t) };
 
                     if has_splice {
-                        let mut u = unsafe { vqsubq_s16(h1[j + 1], io) };
-                        t = unsafe { vqsubq_s16(u, dim1) };
-                        t = unsafe { vmaxq_s16(t, a[j]) };
+                        let mut u = unsafe { _mm_subs_epi16(h1[j + 1], io) };
+                        t = unsafe { _mm_subs_epi16(u, dim1) };
+                        t = unsafe { _mm_max_epi16(t, a[j]) };
                         a[j] = t;
-                        h_vec = unsafe { vmaxq_s16(h_vec, vqsubq_s16(t, ai)) };
+                        h_vec = unsafe { _mm_max_epi16(h_vec, _mm_subs_epi16(t, ai)) };
 
-                        u = unsafe { vqsubq_s16(h1[j], io) };
-                        t = unsafe { vqsubq_s16(u, di) };
-                        t = unsafe { vmaxq_s16(t, b[j]) };
+                        u = unsafe { _mm_subs_epi16(h1[j], io) };
+                        t = unsafe { _mm_subs_epi16(u, di) };
+                        t = unsafe { _mm_max_epi16(t, b[j]) };
                         b[j] = t;
-                        h_vec = unsafe { vmaxq_s16(h_vec, vqsubq_s16(t, aim2)) };
+                        h_vec = unsafe { _mm_max_epi16(h_vec, _mm_subs_epi16(t, aim2)) };
 
-                        t = unsafe { vqsubq_s16(u, dip1) };
-                        t = unsafe { vmaxq_s16(t, c[j]) };
+                        t = unsafe { _mm_subs_epi16(u, dip1) };
+                        t = unsafe { _mm_max_epi16(t, c[j]) };
                         c[j] = t;
-                        h_vec = unsafe { vmaxq_s16(h_vec, vqsubq_s16(t, aim1)) };
+                        h_vec = unsafe { _mm_max_epi16(h_vec, _mm_subs_epi16(t, aim1)) };
                     }
 
-                    t = unsafe { vqsubq_s16(h1[j + 1], fs) };
-                    h_vec = unsafe { vmaxq_s16(h_vec, t) };
-                    t = unsafe { vqsubq_s16(h2[j + 1], fs) };
-                    h_vec = unsafe { vmaxq_s16(h_vec, t) };
-                    t = unsafe { vqsubq_s16(h1[j], fs) };
-                    h_vec = unsafe { vmaxq_s16(h_vec, t) };
-                    t = unsafe { vqsubq_s16(h2[j], fs) };
-                    h_vec = unsafe { vmaxq_s16(h_vec, t) };
+                    t = unsafe { _mm_subs_epi16(h1[j + 1], fs) };
+                    h_vec = unsafe { _mm_max_epi16(h_vec, t) };
+                    t = unsafe { _mm_subs_epi16(h2[j + 1], fs) };
+                    h_vec = unsafe { _mm_max_epi16(h_vec, t) };
+                    t = unsafe { _mm_subs_epi16(h1[j], fs) };
+                    h_vec = unsafe { _mm_max_epi16(h_vec, t) };
+                    t = unsafe { _mm_subs_epi16(h2[j], fs) };
+                    h_vec = unsafe { _mm_max_epi16(h_vec, t) };
 
-                    row_max = unsafe { vmaxq_s16(row_max, h_vec) };
+                    row_max = unsafe { _mm_max_epi16(row_max, h_vec) };
                     h[j + 1] = h_vec;
                     last_h = h_vec;
                 }
 
-                i_state = unsafe { vmaxq_s16(vqsubq_s16(last_h, goe), vqsubq_s16(i_state, ge)) };
+                i_state = unsafe { _mm_max_epi16(_mm_subs_epi16(last_h, goe), _mm_subs_epi16(i_state, ge)) };
                 for _ in 0..LANES {
                     i_state = unsafe { set_lane0(shift_left_2(i_state), NEG) };
                     let mut stopped = false;
                     for j in 0..slen {
                         let mut h_vec = h[j + 1];
-                        h_vec = unsafe { vmaxq_s16(h_vec, i_state) };
-                        row_max = unsafe { vmaxq_s16(row_max, h_vec) };
+                        h_vec = unsafe { _mm_max_epi16(h_vec, i_state) };
+                        row_max = unsafe { _mm_max_epi16(row_max, h_vec) };
                         h[j + 1] = h_vec;
-                        let h_gap = unsafe { vqsubq_s16(h_vec, goe) };
-                        i_state = unsafe { vqsubq_s16(i_state, ge) };
+                        let h_gap = unsafe { _mm_subs_epi16(h_vec, goe) };
+                        i_state = unsafe { _mm_subs_epi16(i_state, ge) };
                         if unsafe { all_le(i_state, h_gap) } {
                             stopped = true;
                             break;
@@ -652,63 +652,63 @@ mod aarch64 {
                 for j in 0..slen {
                     let mut y = zero;
                     let mut z = zero;
-                    let mut h_vec = unsafe { vqaddq_s16(h3[j], s[j]) };
+                    let mut h_vec = unsafe { _mm_adds_epi16(h3[j], s[j]) };
 
-                    let mut t = unsafe { vqsubq_s16(last_h, go) };
+                    let mut t = unsafe { _mm_subs_epi16(last_h, go) };
                     z = unsafe { v_or(z, v_and(cmpgt(i_state, t), set1(1 << 4))) };
-                    t = unsafe { vmaxq_s16(t, i_state) };
-                    i_state = unsafe { vqsubq_s16(t, ge) };
+                    t = unsafe { _mm_max_epi16(t, i_state) };
+                    i_state = unsafe { _mm_subs_epi16(t, ge) };
                     y = unsafe { select(cmpgt(i_state, h_vec), set1(1), y) };
-                    h_vec = unsafe { vmaxq_s16(h_vec, i_state) };
+                    h_vec = unsafe { _mm_max_epi16(h_vec, i_state) };
 
-                    let u0 = unsafe { vqsubq_s16(h3[j + 1], go) };
+                    let u0 = unsafe { _mm_subs_epi16(h3[j + 1], go) };
                     z = unsafe { v_or(z, v_and(cmpgt(d3[j], u0), set1(1 << 5))) };
-                    t = unsafe { vmaxq_s16(u0, d3[j]) };
-                    t = unsafe { vqsubq_s16(t, gei) };
+                    t = unsafe { _mm_max_epi16(u0, d3[j]) };
+                    t = unsafe { _mm_subs_epi16(t, gei) };
                     d[j] = t;
                     y = unsafe { select(cmpgt(t, h_vec), set1(2), y) };
-                    h_vec = unsafe { vmaxq_s16(h_vec, t) };
+                    h_vec = unsafe { _mm_max_epi16(h_vec, t) };
 
                     if has_splice {
-                        let mut u = unsafe { vqsubq_s16(h1[j + 1], io) };
-                        t = unsafe { vqsubq_s16(u, dim1) };
+                        let mut u = unsafe { _mm_subs_epi16(h1[j + 1], io) };
+                        t = unsafe { _mm_subs_epi16(u, dim1) };
                         z = unsafe { v_or(z, v_and(cmpgt(a[j], t), set1(1 << 6))) };
-                        t = unsafe { vmaxq_s16(t, a[j]) };
+                        t = unsafe { _mm_max_epi16(t, a[j]) };
                         a[j] = t;
-                        t = unsafe { vqsubq_s16(t, ai) };
+                        t = unsafe { _mm_subs_epi16(t, ai) };
                         y = unsafe { select(cmpgt(t, h_vec), set1(3), y) };
-                        h_vec = unsafe { vmaxq_s16(h_vec, t) };
+                        h_vec = unsafe { _mm_max_epi16(h_vec, t) };
 
-                        u = unsafe { vqsubq_s16(h1[j], io) };
-                        t = unsafe { vqsubq_s16(u, di) };
+                        u = unsafe { _mm_subs_epi16(h1[j], io) };
+                        t = unsafe { _mm_subs_epi16(u, di) };
                         z = unsafe { v_or(z, v_and(cmpgt(b[j], t), set1(1 << 7))) };
-                        t = unsafe { vmaxq_s16(t, b[j]) };
+                        t = unsafe { _mm_max_epi16(t, b[j]) };
                         b[j] = t;
-                        t = unsafe { vqsubq_s16(t, aim2) };
+                        t = unsafe { _mm_subs_epi16(t, aim2) };
                         y = unsafe { select(cmpgt(t, h_vec), set1(4), y) };
-                        h_vec = unsafe { vmaxq_s16(h_vec, t) };
+                        h_vec = unsafe { _mm_max_epi16(h_vec, t) };
 
-                        t = unsafe { vqsubq_s16(u, dip1) };
+                        t = unsafe { _mm_subs_epi16(u, dip1) };
                         z = unsafe { v_or(z, v_and(cmpgt(c[j], t), set1(1 << 8))) };
-                        t = unsafe { vmaxq_s16(t, c[j]) };
+                        t = unsafe { _mm_max_epi16(t, c[j]) };
                         c[j] = t;
-                        t = unsafe { vqsubq_s16(t, aim1) };
+                        t = unsafe { _mm_subs_epi16(t, aim1) };
                         y = unsafe { select(cmpgt(t, h_vec), set1(5), y) };
-                        h_vec = unsafe { vmaxq_s16(h_vec, t) };
+                        h_vec = unsafe { _mm_max_epi16(h_vec, t) };
                     }
 
-                    t = unsafe { vqsubq_s16(h1[j + 1], fs) };
+                    t = unsafe { _mm_subs_epi16(h1[j + 1], fs) };
                     y = unsafe { select(cmpgt(t, h_vec), set1(6), y) };
-                    h_vec = unsafe { vmaxq_s16(h_vec, t) };
-                    t = unsafe { vqsubq_s16(h2[j + 1], fs) };
+                    h_vec = unsafe { _mm_max_epi16(h_vec, t) };
+                    t = unsafe { _mm_subs_epi16(h2[j + 1], fs) };
                     y = unsafe { select(cmpgt(t, h_vec), set1(7), y) };
-                    h_vec = unsafe { vmaxq_s16(h_vec, t) };
-                    t = unsafe { vqsubq_s16(h1[j], fs) };
+                    h_vec = unsafe { _mm_max_epi16(h_vec, t) };
+                    t = unsafe { _mm_subs_epi16(h1[j], fs) };
                     y = unsafe { select(cmpgt(t, h_vec), set1(8), y) };
-                    h_vec = unsafe { vmaxq_s16(h_vec, t) };
-                    t = unsafe { vqsubq_s16(h2[j], fs) };
+                    h_vec = unsafe { _mm_max_epi16(h_vec, t) };
+                    t = unsafe { _mm_subs_epi16(h2[j], fs) };
                     y = unsafe { select(cmpgt(t, h_vec), set1(9), y) };
-                    h_vec = unsafe { vmaxq_s16(h_vec, t) };
+                    h_vec = unsafe { _mm_max_epi16(h_vec, t) };
 
                     z = unsafe { v_or(z, y) };
                     tb_row[j] = z;
@@ -716,7 +716,7 @@ mod aarch64 {
                     last_h = h_vec;
                 }
 
-                i_state = unsafe { vmaxq_s16(vqsubq_s16(last_h, goe), vqsubq_s16(i_state, ge)) };
+                i_state = unsafe { _mm_max_epi16(_mm_subs_epi16(last_h, goe), _mm_subs_epi16(i_state, ge)) };
                 for _ in 0..LANES {
                     i_state = unsafe { set_lane0(shift_left_2(i_state), NEG) };
                     let mut stopped = false;
@@ -724,11 +724,11 @@ mod aarch64 {
                         let mut z = tb_row[j];
                         let mut h_vec = h[j + 1];
                         z = unsafe { v_or(z, v_and(cmpgt(i_state, h_vec), set1(1 << 9))) };
-                        h_vec = unsafe { vmaxq_s16(h_vec, i_state) };
+                        h_vec = unsafe { _mm_max_epi16(h_vec, i_state) };
                         tb_row[j] = z;
                         h[j + 1] = h_vec;
-                        let h_gap = unsafe { vqsubq_s16(h_vec, goe) };
-                        i_state = unsafe { vqsubq_s16(i_state, ge) };
+                        let h_gap = unsafe { _mm_subs_epi16(h_vec, goe) };
+                        i_state = unsafe { _mm_subs_epi16(i_state, ge) };
                         if unsafe { all_le(i_state, h_gap) } {
                             stopped = true;
                             break;
@@ -783,18 +783,5 @@ mod aarch64 {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-pub(crate) use aarch64::global_gs16b;
-
 #[cfg(target_arch = "x86_64")]
-pub(crate) use crate::sse_dp::global_gs16b;
-
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-pub(crate) fn global_gs16b(
-    ns: &[u8],
-    aa: &[u8],
-    opt: &crate::align::NsOpt<'_>,
-    ss: Option<&[u8]>,
-) -> crate::align::NsResult {
-    crate::scalar_dp::global(ns, aa, opt, ss)
-}
+pub(crate) use x86_64::global_gs16b;

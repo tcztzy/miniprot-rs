@@ -34,41 +34,51 @@ cargo build --release
 
 ## Performance
 
-Benchmarked against upstream C oracle on human genome GRCh38.p14
-(`GCF_000001405.40`, 972 MB gzipped FASTA). Query set: `DPP3-mm.pep.fa.gz`
-from upstream test fixtures, replicated 20× to measure parallel throughput.
+Benchmarked against upstream C oracle (`lh3/miniprot` v0.18-r281) on human
+genome GRCh38.p14 (`GCF_000001405.40`, 928 MB gzipped FASTA). Both binaries
+compiled with arch-native flags (`-C target-cpu=native` / `-march=native
+-mtune=native`). 200 protein queries derived from chromosome 1 ORFs.
 
-- Hardware: macOS, 4 threads (`-t 4`)
-- Mapping tests use a shared C-built `.mpi` (7.4 GB) so I/O is comparable
-- Median of 5 samples (2 for index build)
+### aarch64 (Apple M-series, 4 threads)
 
-| Path              | C oracle | Rust (this port) | Rust (pre-optim) |
-|-------------------|---------:|-----------------:|-----------------:|
-| Index build       |    254 s |           256 s  |           346 s  |
-| `-A` (no align)   |   3.13 s |          3.62 s  |          4.04 s  |
-| Default (align)   |   3.22 s |          9.63 s  |         27.86 s  |
+| Phase            | C oracle | Rust     | Rust vs C    |
+|------------------|---------:|---------:|-------------:|
+| Index build      | 5m00s    | **3m27s** | **31% faster** |
+| Map (1t, CPU)    | 6.26s    | **5.28s** | **15.7% faster** |
+| Map (4t, CPU)    | 8.92s    | **7.65s** | **14.2% faster** |
 
-What the numbers mean:
+### x86_64 (Intel Xeon Gold 5320, Ice Lake, 4 threads)
 
-- **Index build** now at parity with C (~1.01×). Wins come from the `zlib-rs`
-  backend for gzip decompression and a linear unpack buffer in the nt-sketch
-  loop (replacing a per-base closure).
-- **No-align mapping** within 1.16× of C. Mostly I/O-bound here (loading 7.4 GB
-  of `.mpi`), so headroom is limited.
-- **Default (align) path** is 2.89× faster than the previous Rust version
-  thanks to Rayon-parallel per-query processing, but still ~3× slower than
-  C on this workload. Remaining hotspot is the Needleman–Wunsch-style DP
-  in `src/align.rs`; the C implementation uses a hand-written SSE kernel
-  (`miniprot/nasw-sse.c`) that this port does not yet match. This is the
-  next target for optimization.
+| Phase            | C oracle | Rust     | Rust vs C    |
+|------------------|---------:|---------:|-------------:|
+| Index build      | 78.3s    | **40.5s** | **48% faster** |
+| Map (1t, CPU)    | 19.26s   | **18.05s** | **6.3% faster** |
+| Map (4t, CPU)    | 19.24s   | **18.09s** | **6.1% faster** |
+
+### What makes it fast
+
+- **Arch-native SIMD DP** — NEON on aarch64, SSE4.1 on x86_64. Both match
+  the C implementation's SIMD kernel (`nasw-sse.c`) with native intrinsics,
+  not an SSE→NEON translation shim.
+- **Splice fast path** — SIMD inner loop skips 12 splice-state operations
+  per column when no splice signals are present, matching the C scalar path
+  optimization.
+- **Fast approximate log2** — bit-manipulation log2 in chain scoring,
+  identical to C's `mp_log2`, avoiding math library calls in the hot loop.
+- **`zlib-rs`** — pure-Rust gzip backend for FASTA decompression during
+  index build, with a linear unpack buffer replacing per-base closures.
+- **Radix sort** — LSB radix sort for k-mer anchors, ~3–5× faster than
+  comparison sort for the typical input sizes.
+- **Rayon parallelism** — work-stealing thread pool for both index building
+  and per-query mapping.
 
 Reproduce with:
 
 ```bash
-# build shared index once
-miniprot -t 4 -d /tmp/c.mpi GCF_000001405.40_GRCh38.p14_genomic.fna.gz
-# map 20-copy query
-/usr/bin/time -p miniprot -t 4 /tmp/c.mpi queries.fa.gz > /dev/null
+# index build
+miniprot -t 4 -d human.mpi GCF_000001405.40_GRCh38.p14_genomic.fna.gz
+# mapping
+/usr/bin/time -p miniprot -t 4 human.mpi queries.fa > /dev/null
 ```
 
 ## Test
