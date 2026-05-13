@@ -16,6 +16,8 @@ clap = { version = "4.6.0", features = ["derive"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 niffler = { version = "3.0.0", default-features = false, features = ["gz"] }
 noodles = { version = "0.109.0", features = ["core", "fasta", "gff", "gtf", "sam"] }
+metal = "0.31"
+objc = "0.2"
 rayon = "1.11.0"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 
