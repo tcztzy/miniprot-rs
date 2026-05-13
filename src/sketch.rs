@@ -169,7 +169,7 @@ where
     if out.len() <= 1 {
         return out;
     }
-    out.sort_unstable();
+    crate::sort::radix_sort_u64(&mut out);
     out.dedup();
     out
 }
@@ -191,6 +191,39 @@ pub fn sketch_nt4(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn sketch_nt4_packed_db_into(
+    db: &NtDb,
+    vid: VirtualId,
+    tables: &Tables,
+    min_aa_len: i32,
+    kmer: i32,
+    mod_bit: i32,
+    bbit: i32,
+    boff: i64,
+    buf: &mut Vec<u8>,
+) -> Vec<u64> {
+    let ctg = &db.contigs[vid.contig().index()];
+    let off = ctg.off;
+    let len = ctg.len;
+    let rev = vid.is_rev();
+    let end = off + len - 1;
+    buf.resize(len as usize, 0);
+    if !rev {
+        for (i, dst) in buf.iter_mut().enumerate() {
+            *dst = packed_nt(&db.seq, off + i as i64);
+        }
+    } else {
+        for (i, dst) in buf.iter_mut().enumerate() {
+            let b = packed_nt(&db.seq, end - i as i64);
+            *dst = if b < 4 { 3 - b } else { b };
+        }
+    }
+    sketch_nt4_core(tables, len, min_aa_len, kmer, mod_bit, bbit, boff, |i| {
+        buf[i]
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn sketch_nt4_packed_db(
     db: &NtDb,
     vid: VirtualId,
@@ -201,16 +234,10 @@ fn sketch_nt4_packed_db(
     bbit: i32,
     boff: i64,
 ) -> Vec<u64> {
-    let ctg = &db.contigs[vid.contig().index()];
-    let off = ctg.off;
-    let len = ctg.len;
-    let rev = vid.is_rev();
-    let end = off + len - 1;
-    sketch_nt4_core(tables, len, min_aa_len, kmer, mod_bit, bbit, boff, |i| {
-        let pos = if rev { end - i as i64 } else { off + i as i64 };
-        let base = packed_nt(&db.seq, pos);
-        if rev && base < 4 { 3 - base } else { base }
-    })
+    let mut buf = Vec::new();
+    sketch_nt4_packed_db_into(
+        db, vid, tables, min_aa_len, kmer, mod_bit, bbit, boff, &mut buf,
+    )
 }
 
 pub fn collect_nt_sketches(
@@ -253,9 +280,10 @@ pub fn collect_nt_sketches_flat(
     bo: &[u32],
 ) -> Vec<u64> {
     let mut all = Vec::new();
+    let mut buf = Vec::new();
     for idx in 0..db.contigs.len() * 2 {
         let vid = VirtualId::from_index(idx).expect("virtual id index should be valid");
-        let sketches = sketch_nt4_packed_db(
+        let sketches = sketch_nt4_packed_db_into(
             db,
             vid,
             tables,
@@ -264,6 +292,7 @@ pub fn collect_nt_sketches_flat(
             opt.mod_bit,
             opt.bbit,
             bo[vid.to_index()] as i64,
+            &mut buf,
         );
         all.extend(sketches);
     }

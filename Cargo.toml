@@ -13,10 +13,20 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.0", features = ["derive"] }
+flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 niffler = { version = "3.0.0", default-features = false, features = ["gz"] }
 noodles = { version = "0.109.0", features = ["core", "fasta", "gff", "gtf", "sam"] }
 rayon = "1.11.0"
 zerocopy = { version = "0.8.48", features = ["derive"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+
+[profile.release.build-override]
+opt-level = 3
 
 [dev-dependencies]
 assert_cmd = "2.2.0"

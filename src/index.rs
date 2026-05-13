@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
-use crate::io::{read_i64_slice, read_u32_slice, write_i64_slice, write_u32_slice};
+use crate::io::{read_i64_as_usize_vec, read_u32_slice, write_u32_slice, write_usize_as_i64_slice};
 use crate::seqdb::NtDb;
 use crate::sketch::{collect_nt_sketches, collect_nt_sketches_flat};
 use crate::tables::{Tables, make_tables};
@@ -79,19 +79,14 @@ impl Index {
         writer.write_all(self.opt.as_bytes())?;
         writer.write_all(&usize_to_i64(self.n_kb)?.to_le_bytes())?;
         self.nt.dump(writer)?;
-        let ki: Vec<_> = self
-            .ki
-            .iter()
-            .copied()
-            .map(usize_to_i64)
-            .collect::<crate::Result<_>>()?;
-        write_i64_slice(writer, &ki)?;
+        write_usize_as_i64_slice(writer, &self.ki)?;
         write_u32_slice(writer, &self.kb)?;
         Ok(())
     }
 
     pub fn restore<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
-        let mut reader = BufReader::new(File::open(path)?);
+        // Large buffer (1 MiB) avoids excessive read() syscalls on the 7+ GiB index.
+        let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?);
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
         if &magic != MP_IDX_MAGIC {
@@ -104,12 +99,7 @@ impl Index {
         let n_kb = i64_to_usize(i64::from_le_bytes(buf8), "invalid k-mer pair count")?;
         let nt = NtDb::restore(&mut reader)?;
         let ki_len = opt.n_bucket();
-        let mut ki_raw = vec![0i64; ki_len];
-        read_i64_slice(&mut reader, &mut ki_raw)?;
-        let ki = ki_raw
-            .into_iter()
-            .map(|offset| i64_to_usize(offset, "invalid k-mer bucket offset"))
-            .collect::<crate::Result<Vec<_>>>()?;
+        let ki = read_i64_as_usize_vec(&mut reader, ki_len)?;
         let mut kb = vec![0u32; n_kb];
         read_u32_slice(&mut reader, &mut kb)?;
         let (bo, n_block) = idx_boff(&nt, opt.bbit);

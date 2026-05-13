@@ -9,6 +9,7 @@ use crate::hit::{
     cal_chn_sc_ungap, cal_max_ext, reg_gen_from_block, select_sub, set_parent, sort_reg,
 };
 use crate::sketch::{sketch_nt4, sketch_prot};
+use crate::sort::radix_sort_anchors;
 use crate::types::{
     Alignment, Anchor, MP_F_NO_ALIGN, MP_F_NO_PRE_CHAIN, MP_F_NO_SPLICE, MapOptions, lo32,
 };
@@ -109,7 +110,7 @@ fn refine_reg(
             append_anchor_product(nt_group, query_group, &mut anchors);
         }
     }
-    anchors.sort_unstable();
+    radix_sort_anchors(&mut anchors);
     let Some(result) = chain(
         opt.max_intron,
         opt.max_gap,
@@ -127,6 +128,10 @@ fn refine_reg(
         reg.invalidate();
         return;
     };
+    if result.chains.is_empty() {
+        reg.invalidate();
+        return;
+    }
 
     let (max_i, &best_chain) = result
         .chains
@@ -153,7 +158,7 @@ fn refine_reg(
 pub fn map_protein(mi: &Index, seq: &str, opt: &MapOptions) -> crate::Result<Vec<Alignment>> {
     let is_splice = (opt.flag & MP_F_NO_SPLICE) == 0;
     let mut query_sketches = sketch_prot(&mi.tables, seq.as_bytes(), mi.opt.kmer, mi.opt.mod_bit);
-    query_sketches.sort_unstable();
+    crate::sort::radix_sort_u64(&mut query_sketches);
 
     let max_occ = if query_sketches.len() >= 8 {
         cal_max_occ(mi, &query_sketches).min(opt.max_occ)
@@ -170,7 +175,7 @@ pub fn map_protein(mi: &Index, seq: &str, opt: &MapOptions) -> crate::Result<Vec
             }));
         }
     }
-    anchors.sort_unstable();
+    radix_sort_anchors(&mut anchors);
 
     if (opt.flag & MP_F_NO_PRE_CHAIN) == 0 && is_splice {
         let block_width = 1 << mi.opt.bbit;
@@ -189,7 +194,7 @@ pub fn map_protein(mi: &Index, seq: &str, opt: &MapOptions) -> crate::Result<Vec
             std::mem::take(&mut anchors),
         ) {
             anchors = result.anchors;
-            anchors.sort_unstable();
+            radix_sort_anchors(&mut anchors);
         }
     }
 
@@ -215,7 +220,7 @@ pub fn map_protein(mi: &Index, seq: &str, opt: &MapOptions) -> crate::Result<Vec
 
     let ext = cal_max_ext(None, &regs, 100, opt.max_ext);
     let mut refine_query_sketches = sketch_prot(&mi.tables, seq.as_bytes(), opt.kmer2, 0);
-    refine_query_sketches.sort_unstable();
+    crate::sort::radix_sort_u64(&mut refine_query_sketches);
     let mut refined: Vec<_> = regs
         .into_iter()
         .zip(ext)
@@ -236,17 +241,33 @@ pub fn map_protein(mi: &Index, seq: &str, opt: &MapOptions) -> crate::Result<Vec
 }
 
 pub fn map_file<P: AsRef<Path>>(mi: &Index, path: P, opt: &MapOptions) -> crate::Result<String> {
-    let queries = read_queries_path(path)?;
-    map_queries(mi, &queries, opt)
+    map_file_threads(mi, path, opt, 1)
 }
 
-fn map_queries(mi: &Index, queries: &[QueryRecord], opt: &MapOptions) -> crate::Result<String> {
+pub fn map_file_threads<P: AsRef<Path>>(
+    mi: &Index,
+    path: P,
+    opt: &MapOptions,
+    threads: i32,
+) -> crate::Result<String> {
+    let queries = read_queries_path(path)?;
+    map_queries(mi, &queries, opt, threads)
+}
+
+fn map_queries(
+    mi: &Index,
+    queries: &[QueryRecord],
+    opt: &MapOptions,
+    threads: i32,
+) -> crate::Result<String> {
+    use rayon::prelude::*;
+
     let mut out = String::new();
     if (opt.flag & crate::types::MP_F_GFF) != 0 {
         out.push_str("##gff-version 3\n");
     }
-    let mut next_id = 1i64;
-    for query in queries {
+
+    let map_one = |query: &QueryRecord| -> crate::Result<Vec<Alignment>> {
         let mut regs = map_protein(mi, &query.seq, opt)?;
         if (opt.flag & MP_F_NO_ALIGN) == 0 {
             let ext = cal_max_ext(Some(&mi.nt), &regs, 100, opt.max_intron / 2);
@@ -270,27 +291,70 @@ fn map_queries(mi: &Index, queries: &[QueryRecord], opt: &MapOptions) -> crate::
             select_multi_exon(&mut regs, opt.io);
             rank_regs(mi, opt, opt.pri_ratio, &mut regs);
         }
-        if regs.is_empty() {
-            write_output(&mut out, mi, query, None, opt, 0, 0);
-            continue;
+        Ok(regs)
+    };
+
+    let mut next_id = 1i64;
+    let mut write_regs = |out: &mut String, query: &QueryRecord, regs: &mut Vec<Alignment>| {
+        write_query_regs(out, mi, query, regs, opt, &mut next_id);
+    };
+
+    if threads <= 1 {
+        for query in queries {
+            let mut regs = map_one(query)?;
+            write_regs(&mut out, query, &mut regs);
         }
-        let best_sc = regs[0].score();
-        let mut n_out = 0i32;
-        for (j, reg) in regs.iter().take(opt.out_n as usize).enumerate() {
-            let sc = reg.score();
-            if sc <= 0 || (sc as f64) < (best_sc as f64) * (opt.out_sim as f64) {
-                continue;
+    } else {
+        let threads = threads as usize;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|err| {
+                crate::Error::InvalidArgument(format!("failed to build mapping thread pool: {err}"))
+            })?;
+        let chunk_size = (threads * 1024).clamp(1024, 4096);
+        for chunk in queries.chunks(chunk_size) {
+            let mut chunk_regs = pool.install(|| {
+                chunk
+                    .par_iter()
+                    .map(map_one)
+                    .collect::<crate::Result<Vec<_>>>()
+            })?;
+            for (query, regs) in chunk.iter().zip(chunk_regs.iter_mut()) {
+                write_regs(&mut out, query, regs);
             }
-            if ((reg.qe - reg.qs) as f64) < (query.seq.len() as f64) * (opt.out_cov as f64) {
-                continue;
-            }
-            write_output(&mut out, mi, query, Some(reg), opt, next_id, j as i32 + 1);
-            next_id += 1;
-            n_out += 1;
-        }
-        if n_out == 0 {
-            write_output(&mut out, mi, query, None, opt, 0, 0);
         }
     }
     Ok(out)
+}
+
+fn write_query_regs(
+    out: &mut String,
+    mi: &Index,
+    query: &QueryRecord,
+    regs: &mut [Alignment],
+    opt: &MapOptions,
+    next_id: &mut i64,
+) {
+    if regs.is_empty() {
+        write_output(out, mi, query, None, opt, 0, 0);
+        return;
+    }
+    let best_sc = regs[0].score();
+    let mut n_out = 0i32;
+    for (j, reg) in regs.iter().take(opt.out_n as usize).enumerate() {
+        let sc = reg.score();
+        if sc <= 0 || (sc as f64) < (best_sc as f64) * (opt.out_sim as f64) {
+            continue;
+        }
+        if ((reg.qe - reg.qs) as f64) < (query.seq.len() as f64) * (opt.out_cov as f64) {
+            continue;
+        }
+        write_output(out, mi, query, Some(reg), opt, *next_id, j as i32 + 1);
+        *next_id += 1;
+        n_out += 1;
+    }
+    if n_out == 0 {
+        write_output(out, mi, query, None, opt, 0, 0);
+    }
 }

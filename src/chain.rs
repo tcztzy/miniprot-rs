@@ -1,4 +1,19 @@
+use std::cell::UnsafeCell;
+
 use crate::types::{Anchor, ChainMeta, MP_BLOCK_BONUS};
+
+/// Fast approximate log2(x) for x >= 2 using float bit manipulation.
+/// Identical to C miniprot's `mp_log2`.
+#[inline(always)]
+fn fast_log2(x: i32) -> f32 {
+    let mut bits = (x as f32).to_bits();
+    let mut log_2 = ((bits >> 23) & 255) as f32 - 128.0;
+    bits &= !(255 << 23);
+    bits += 127 << 23;
+    let z = f32::from_bits(bits);
+    log_2 += (-0.34484843 * z + 2.02466578) * z - 0.67487759;
+    log_2
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ScoredAnchor {
@@ -12,39 +27,76 @@ pub struct ChainResult {
     pub chains: Vec<ChainMeta>,
 }
 
+struct ChainWorkspace {
+    predecessor: Vec<isize>,
+    best_score: Vec<i32>,
+    peak_score: Vec<i32>,
+    state: Vec<i32>,
+}
+
+impl ChainWorkspace {
+    const fn new() -> Self {
+        Self {
+            predecessor: Vec::new(),
+            best_score: Vec::new(),
+            peak_score: Vec::new(),
+            state: Vec::new(),
+        }
+    }
+
+    fn resize(&mut self, n: usize) {
+        self.predecessor.resize(n, -1);
+        self.predecessor[..n].fill(-1);
+        self.best_score.resize(n, 0);
+        self.best_score[..n].fill(0);
+        self.peak_score.resize(n, 0);
+        self.peak_score[..n].fill(0);
+        self.state.resize(n, 0);
+        self.state[..n].fill(0);
+    }
+}
+
+thread_local! {
+    static CHAIN_WORKSPACE: UnsafeCell<ChainWorkspace> =
+        UnsafeCell::new(ChainWorkspace::new());
+}
+
 fn chain_bk_end(
     max_drop: i32,
     z: &[ScoredAnchor],
     f: &[i32],
-    p: &[Option<usize>],
+    p: &[isize],
     t: &mut [i32],
     k: usize,
-) -> Option<usize> {
-    let mut i = Some(z[k].index);
+) -> isize {
+    let mut i = z[k].index as isize;
     let mut max_i = i;
     let mut max_s = 0i32;
-    if t[z[k].index] != 0 {
+    if t[i as usize] != 0 {
         return i;
     }
     let end_i = loop {
-        let idx = i.expect("active backtrack index");
+        let idx = i as usize;
         t[idx] = 2;
-        let next = p[idx];
-        i = next;
-        let s = i.map(|i| z[k].score - f[i]).unwrap_or(z[k].score);
+        i = p[idx];
+        let s = if i < 0 {
+            z[k].score
+        } else {
+            z[k].score - f[i as usize]
+        };
         if s > max_s {
             max_s = s;
             max_i = i;
         } else if max_s - s > max_drop {
-            break next;
+            break i;
         }
-        if i.is_none_or(|idx| t[idx] != 0) {
-            break next;
+        if i < 0 || t[i as usize] != 0 {
+            break i;
         }
     };
-    let mut cur = Some(z[k].index);
-    while cur.is_some() && cur != end_i {
-        let idx = cur.expect("active cleanup index");
+    let mut cur = z[k].index as isize;
+    while cur >= 0 && cur != end_i {
+        let idx = cur as usize;
         t[idx] = 0;
         cur = p[idx];
     }
@@ -55,7 +107,7 @@ fn chain_bk_end(
 fn backtrack_chain<F>(
     scored_anchors: &[ScoredAnchor],
     f: &[i32],
-    p: &[Option<usize>],
+    p: &[isize],
     state: &mut [i32],
     max_drop: i32,
     rank: usize,
@@ -66,21 +118,26 @@ where
 {
     let item = &scored_anchors[rank];
     let end_idx = chain_bk_end(max_drop, scored_anchors, f, p, state, rank);
-    let mut i = Some(item.index);
+    let mut i = item.index as isize;
     let mut len = 0usize;
     while i != end_idx {
-        let idx = i.expect("active backtrack index");
+        let idx = i as usize;
         keep_anchor(idx);
         len += 1;
         state[idx] = 1;
         i = p[idx];
     }
-    (i.map(|i| item.score - f[i]).unwrap_or(item.score), len)
+    let score = if i < 0 {
+        item.score
+    } else {
+        item.score - f[i as usize]
+    };
+    (score, len)
 }
 
 fn chain_backtrack(
     f: &[i32],
-    p: &[Option<usize>],
+    p: &[isize],
     state: &mut [i32],
     min_cnt: i32,
     min_sc: i32,
@@ -220,7 +277,7 @@ fn compute_sc(
     if dd > 0 {
         let lin_pen = dd as f32 * 0.33334;
         let log_pen = if dd >= 2 {
-            chn_coef_log * (((dd + 1) as f32).log2() - 1.0) + 1.0
+            chn_coef_log * (fast_log2(dd + 1) - 1.0) + 1.0
         } else {
             dd as f32
         };
@@ -263,12 +320,52 @@ pub fn chain(
     if !is_spliced {
         max_dist_y = max_dist_y.max(bw);
     }
+    let anchor_count = a.len();
+
+    CHAIN_WORKSPACE.with(|cell| {
+        // SAFETY: thread-local storage guarantees exclusive access within this thread.
+        let ws = unsafe { &mut *cell.get() };
+        ws.resize(anchor_count);
+        chain_inner(
+            max_dist_x,
+            max_dist_y,
+            bw,
+            max_skip,
+            max_iter,
+            min_cnt,
+            min_sc,
+            chn_coef_log,
+            is_spliced,
+            kmer,
+            bbit,
+            a,
+            ws,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chain_inner(
+    max_dist_x: i32,
+    max_dist_y: i32,
+    bw: i32,
+    max_skip: i32,
+    max_iter: i32,
+    min_cnt: i32,
+    min_sc: i32,
+    chn_coef_log: f32,
+    is_spliced: bool,
+    kmer: i32,
+    bbit: i32,
+    a: Vec<Anchor>,
+    ws: &mut ChainWorkspace,
+) -> Option<ChainResult> {
     let max_drop = if is_spliced { i32::MAX } else { bw };
     let anchor_count = a.len();
-    let mut predecessor = vec![None; anchor_count];
-    let mut best_score = vec![0i32; anchor_count];
-    let mut peak_score = vec![0i32; anchor_count];
-    let mut state = vec![0i32; anchor_count];
+    let predecessor = &mut ws.predecessor[..anchor_count];
+    let best_score = &mut ws.best_score[..anchor_count];
+    let peak_score = &mut ws.peak_score[..anchor_count];
+    let state = &mut ws.state[..anchor_count];
 
     let sc_pair = |ai: Anchor, aj: Anchor| -> i32 {
         compute_sc(
@@ -289,7 +386,7 @@ pub fn chain(
     for i in 0..anchor_count {
         let ai = a[i];
         let ai_block = ai.target();
-        let mut best_predecessor = None;
+        let mut best_predecessor = -1isize;
         let mut chain_score_here = kmer;
         let mut skipped = 0i32;
         while window_start < i && ((ai_block - a[window_start].target()) << bbit) > max_dist_x {
@@ -299,7 +396,7 @@ pub fn chain(
             let sc = best_anchor_score + sc_pair(ai, a[best_anchor_idx]);
             if sc > chain_score_here {
                 chain_score_here = sc;
-                best_predecessor = Some(best_anchor_idx);
+                best_predecessor = best_anchor_idx as isize;
             }
         } else {
             best_anchor_score = 0;
@@ -316,7 +413,7 @@ pub fn chain(
             let sc = sc + best_score[j];
             if sc > chain_score_here {
                 chain_score_here = sc;
-                best_predecessor = Some(j);
+                best_predecessor = j as isize;
                 if skipped > 0 {
                     skipped -= 1;
                 }
@@ -326,14 +423,14 @@ pub fn chain(
                     break;
                 }
             }
-            if let Some(predecessor_idx) = predecessor[j] {
-                state[predecessor_idx] = i as i32;
+            if predecessor[j] >= 0 {
+                state[predecessor[j] as usize] = i as i32;
             }
         }
         best_score[i] = chain_score_here;
         predecessor[i] = best_predecessor;
-        peak_score[i] = if let Some(best_predecessor_idx) = best_predecessor {
-            peak_score[best_predecessor_idx].max(chain_score_here)
+        peak_score[i] = if best_predecessor >= 0 {
+            peak_score[best_predecessor as usize].max(chain_score_here)
         } else {
             chain_score_here
         };
@@ -343,13 +440,7 @@ pub fn chain(
         }
     }
 
-    let (chains, anchor_indices) = chain_backtrack(
-        &best_score,
-        &predecessor,
-        &mut state,
-        min_cnt,
-        min_sc,
-        max_drop,
-    )?;
+    let (chains, anchor_indices) =
+        chain_backtrack(best_score, predecessor, state, min_cnt, min_sc, max_drop)?;
     Some(compact_anchors(chains, anchor_indices, a))
 }

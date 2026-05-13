@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::{ArgAction, Parser, error::ErrorKind};
 
 use crate::index::Index;
-use crate::map_file;
+use crate::map_file_threads;
 use crate::types::{
     IndexOptions, MP_F_GFF, MP_F_GTF, MP_F_NO_ALIGN, MP_F_NO_CS, MP_F_NO_PAF, MP_F_NO_PRE_CHAIN,
     MP_F_NO_SPLICE, MP_F_SHOW_RESIDUE, MP_F_SHOW_TRANS, MP_F_SHOW_UNMAP, MP_VERSION, MapOptions,
@@ -273,7 +273,7 @@ where
     }
     if !args.queries.is_empty() {
         for query in &args.queries {
-            print!("{}", map_file(&mi, query, &mo)?);
+            print!("{}", map_file_threads(&mi, query, &mo, args.threads)?);
         }
     }
     Ok(ExitCode::SUCCESS)

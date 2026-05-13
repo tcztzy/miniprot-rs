@@ -32,6 +32,45 @@ It does not guarantee computational identity or byte-for-byte identity. In other
 cargo build --release
 ```
 
+## Performance
+
+Benchmarked against upstream C oracle on human genome GRCh38.p14
+(`GCF_000001405.40`, 972 MB gzipped FASTA). Query set: `DPP3-mm.pep.fa.gz`
+from upstream test fixtures, replicated 20× to measure parallel throughput.
+
+- Hardware: macOS, 4 threads (`-t 4`)
+- Mapping tests use a shared C-built `.mpi` (7.4 GB) so I/O is comparable
+- Median of 5 samples (2 for index build)
+
+| Path              | C oracle | Rust (this port) | Rust (pre-optim) |
+|-------------------|---------:|-----------------:|-----------------:|
+| Index build       |    254 s |           256 s  |           346 s  |
+| `-A` (no align)   |   3.13 s |          3.62 s  |          4.04 s  |
+| Default (align)   |   3.22 s |          9.63 s  |         27.86 s  |
+
+What the numbers mean:
+
+- **Index build** now at parity with C (~1.01×). Wins come from the `zlib-rs`
+  backend for gzip decompression and a linear unpack buffer in the nt-sketch
+  loop (replacing a per-base closure).
+- **No-align mapping** within 1.16× of C. Mostly I/O-bound here (loading 7.4 GB
+  of `.mpi`), so headroom is limited.
+- **Default (align) path** is 2.89× faster than the previous Rust version
+  thanks to Rayon-parallel per-query processing, but still ~3× slower than
+  C on this workload. Remaining hotspot is the Needleman–Wunsch-style DP
+  in `src/align.rs`; the C implementation uses a hand-written SSE kernel
+  (`miniprot/nasw-sse.c`) that this port does not yet match. This is the
+  next target for optimization.
+
+Reproduce with:
+
+```bash
+# build shared index once
+miniprot -t 4 -d /tmp/c.mpi GCF_000001405.40_GRCh38.p14_genomic.fna.gz
+# map 20-copy query
+/usr/bin/time -p miniprot -t 4 /tmp/c.mpi queries.fa.gz > /dev/null
+```
+
 ## Test
 
 The oracle and parity tests depend on the upstream C implementation and its bundled fixtures.

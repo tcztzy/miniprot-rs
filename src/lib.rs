@@ -7,15 +7,20 @@ mod hit;
 mod index;
 mod io;
 mod map;
+mod neon_dp;
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+mod scalar_dp;
 mod seqdb;
+
 mod sketch;
+mod sort;
 mod tables;
 mod types;
 
 pub use cli::run_cli;
 pub use fastx::QueryRecord;
 pub use index::Index;
-pub use map::{map_file, map_protein};
+pub use map::{map_file, map_file_threads, map_protein};
 pub use seqdb::{Contig, NtDb};
 pub use tables::{Tables, make_tables};
 pub use types::{
