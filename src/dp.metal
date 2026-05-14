@@ -50,7 +50,8 @@ kernel void dp_batch(
     int nl = (int)p.nl;
     bool is_ext = (p.flag & 6) != 0;
 
-    const uint max_al = 256;
+    // Stack arrays sized for typical protein queries. Larger al → CPU fallback.
+    const uint max_al = 128;
     if (al > (int)max_al) {
         results[tid] = DpResult{-1, 0, 0};
         return;

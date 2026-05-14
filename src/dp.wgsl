@@ -25,7 +25,7 @@ struct DpResult {
 
 const NEG_INF: i32 = -536870912;
 const AA_STOP: u32 = 20u;
-const MAX_AL: u32 = 256u;
+const MAX_AL: u32 = 128u;
 
 @group(0) @binding(0) var<storage, read> nas_buf: array<u32>;
 @group(0) @binding(1) var<storage, read> aas_buf: array<u32>;
