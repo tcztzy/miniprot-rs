@@ -1,8 +1,8 @@
 //! GPU-accelerated DP via Metal compute shaders on Apple Silicon.
 //!
 //! On Apple Silicon (unified memory), we pass pointers directly — zero copy.
-//! The Metal shader runs the scalar DP algorithm; each GPU thread processes
-//! one DP call. Batch size 32+ needed to amortize dispatch overhead (~50 us).
+//! One GPU thread per DP call, scalar DP. Batch size 256+ to amortize ~86ms
+//! dispatch overhead.
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -73,7 +73,7 @@ mod imp {
         ensure_gpu().is_some()
     }
 
-    /// Run batched DP on GPU with default BLOSUM62 matrix.
+    /// Run batched DP with default BLOSUM62 matrix.
     pub fn batch_dp(
         nas_buf: &[u8],
         aas_buf: &[u8],
@@ -96,7 +96,6 @@ mod imp {
             return Some(Vec::new());
         }
 
-        // Flatten 22x22 matrix to [i8; 484]
         let flat_matrix: [i8; 484] = unsafe { std::mem::transmute(*matrix) };
 
         autoreleasepool(|| {
@@ -113,7 +112,7 @@ mod imp {
             );
             let params_gpu = state.device.new_buffer_with_data(
                 params.as_ptr() as *const std::ffi::c_void,
-                (params.len() * std::mem::size_of::<DpParams>()) as u64,
+                params.len() as u64 * std::mem::size_of::<DpParams>() as u64,
                 opts,
             );
             let results_gpu = state.device.new_buffer(
@@ -150,8 +149,7 @@ mod imp {
         })
     }
 
-    /// Measure kernel-only time by pre-allocating and reusing buffers.
-    /// Returns (warmup_duration, timed_dispatch_duration).
+    /// Measure kernel-only time: pre-allocate buffers, warmup, then timed dispatch.
     pub fn bench_dispatch_only(
         nas_buf: &[u8],
         aas_buf: &[u8],
@@ -181,7 +179,7 @@ mod imp {
             );
             let params_gpu = state.device.new_buffer_with_data(
                 params.as_ptr() as *const std::ffi::c_void,
-                (params.len() * std::mem::size_of::<DpParams>()) as u64,
+                params.len() as u64 * std::mem::size_of::<DpParams>() as u64,
                 opts,
             );
             let results_gpu = state.device.new_buffer(
@@ -237,48 +235,17 @@ mod imp {
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct DpParams {
-        pub nas_offset: u32,
-        pub aas_offset: u32,
-        pub nl: u32,
-        pub al: u32,
-        pub go: i32,
-        pub ge: i32,
-        pub io: i32,
-        pub fs: i32,
-        pub goe: i32,
-        pub end_bonus: i32,
-        pub flag: i32,
-        pub slen: u32,
+        pub nas_offset: u32, pub aas_offset: u32, pub nl: u32, pub al: u32,
+        pub go: i32, pub ge: i32, pub io: i32, pub fs: i32,
+        pub goe: i32, pub end_bonus: i32, pub flag: i32, pub slen: u32,
     }
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
-    pub struct DpResult {
-        pub score: i32,
-        pub nt_len: i32,
-        pub aa_len: i32,
-    }
-    pub fn available() -> bool {
-        false
-    }
-    pub fn batch_dp(_nas: &[u8], _aas: &[u8], _params: &[DpParams]) -> Option<Vec<DpResult>> {
-        None
-    }
-    pub fn batch_dp_with_matrix(
-        _nas: &[u8],
-        _aas: &[u8],
-        _params: &[DpParams],
-        _matrix: &[[i8; 22]; 22],
-    ) -> Option<Vec<DpResult>> {
-        None
-    }
-    pub fn bench_dispatch_only(
-        _nas: &[u8],
-        _aas: &[u8],
-        _params: &[DpParams],
-        _matrix: &[[i8; 22]; 22],
-    ) -> Option<(std::time::Duration, std::time::Duration)> {
-        None
-    }
+    pub struct DpResult { pub score: i32, pub nt_len: i32, pub aa_len: i32 }
+    pub fn available() -> bool { false }
+    pub fn batch_dp(_nas: &[u8], _aas: &[u8], _params: &[DpParams]) -> Option<Vec<DpResult>> { None }
+    pub fn batch_dp_with_matrix(_nas: &[u8], _aas: &[u8], _params: &[DpParams], _matrix: &[[i8; 22]; 22]) -> Option<Vec<DpResult>> { None }
+    pub fn bench_dispatch_only(_nas: &[u8], _aas: &[u8], _params: &[DpParams], _matrix: &[[i8; 22]; 22]) -> Option<(std::time::Duration, std::time::Duration)> { None }
 }
 #[cfg(not(target_os = "macos"))]
 pub(crate) use imp::*;

@@ -487,6 +487,42 @@ fn bench_kernel_only() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn bench_metal_vs_scalar_large() {
+    eprintln!("\n=== Metal vs CPU (nl=3000, al=50, large batches) ===");
+    let mut seed: u64 = 77777;
+    let mut rng = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        seed
+    };
+
+    let batch_sizes = [64, 256, 512, 1024];
+
+    for &bs in &batch_sizes {
+        eprintln!("\n--- Batch size: {bs} ---");
+        let data = generate_workload(bs, 3000, 50, false, &mut rng);
+
+        let (scalar_results, scalar_time) = run_cpu_scalar(&data, false);
+        let (_neon_res, neon_time) = run_cpu_neon(&data, false);
+        eprintln!("  CPU scalar: {} total, {}/call", format_dur(scalar_time), format_dur(scalar_time / bs as u32));
+        eprintln!("  CPU NEON:   {} total, {}/call", format_dur(neon_time), format_dur(neon_time / bs as u32));
+
+        if let Some(br) = run_metal_batch(&data, 1) {
+            let (ok, _, _) = check_correctness(&scalar_results, &br.results, 2);
+            eprintln!(
+                "  Metal:      {} total, {}/call  [ok:{ok}/{bs}]  {:.1}x CPU scalar  {:.1}x CPU NEON",
+                format_dur(br.total), format_dur(br.per_call),
+                scalar_time.as_secs_f64() / br.total.as_secs_f64().max(1e-9),
+                neon_time.as_secs_f64() / br.total.as_secs_f64().max(1e-9),
+            );
+        } else {
+            eprintln!("  Metal:      n/a");
+        }
+    }
+}
+
+#[test]
 fn report_code_metrics() {
     eprintln!("\n=== Code Metrics ===");
 
