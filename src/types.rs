@@ -372,7 +372,6 @@ pub struct MapOptions {
     pub max_intron_flank: i32,
     pub gff_prefix: String,
     pub mat: [[i8; 22]; 22],
-    pub use_metal: bool,
 }
 
 impl Default for MapOptions {
@@ -424,7 +423,6 @@ impl MapOptions {
             max_intron_flank: 200,
             gff_prefix: "MP".to_owned(),
             mat: tables::BLOSUM62,
-            use_metal: false,
         };
         tables::set_stop_sc(opt.asize, &mut opt.mat, opt.fs);
         opt

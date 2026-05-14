@@ -299,23 +299,6 @@ fn map_queries(
         write_query_regs(out, mi, query, regs, opt, &mut next_id);
     };
 
-    // Metal GPU warmup: on first use, compiles compute shader and creates pipeline.
-    // Measured dispatch: 271 μs for 100 calls (2.7 μs/call) vs CPU NEON 26 μs/call (9.6×).
-    // align_reg extension batching is future work — GPU infra ready and verified.
-    let _metal_warmed = opt.use_metal
-        && crate::metal_dp::available()
-        && {
-            // Warmup with tiny real dispatch to engage GPU pipeline.
-            let tiny_nas = vec![0u8; 18];
-            let tiny_aas = vec![0u8; 6];
-            let tiny_params = vec![crate::metal_dp::DpParams {
-                nas_offset: 0, aas_offset: 0,
-                nl: 18, al: 6, go: 11, ge: 1, io: 29, fs: 23, goe: 12,
-                end_bonus: 5, flag: 2, slen: 1, _pad: [0; 3],
-            }];
-            crate::metal_dp::batch_dp(&tiny_nas, &tiny_aas, &tiny_params).is_some()
-        };
-
     if threads <= 1 {
         for query in queries {
             let mut regs = map_one(query)?;

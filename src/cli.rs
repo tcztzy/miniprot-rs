@@ -116,8 +116,6 @@ struct Args {
     chn_coef_log: f32,
     #[arg(short = 'K', default_value_t = 2_000_000)]
     mini_batch_size: i64,
-    #[arg(long = "metal", action = ArgAction::SetTrue, help = "Use Metal GPU for DP alignment (Apple Silicon only)")]
-    use_metal: bool,
     #[arg(short = 's', action = ArgAction::SetTrue, hide = true)]
     deprecated_s: bool,
     #[arg(value_name = "REF")]
@@ -247,9 +245,6 @@ where
     }
     mo.gff_prefix = args.gff_prefix;
 
-    if args.use_metal {
-        mo.use_metal = true;
-    }
     if args.deprecated_s {
         eprintln!("Option '-s' is deprecated.");
     }
