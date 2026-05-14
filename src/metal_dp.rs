@@ -194,3 +194,90 @@ mod imp {
 }
 #[cfg(not(target_os = "macos"))]
 pub(crate) use imp::*;
+
+#[cfg(test)]
+mod bench_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn metal_dispatch_overhead() {
+        if !available() {
+            eprintln!("Metal not available");
+            return;
+        }
+
+        // Generate 100 DP calls for extension-like sizes
+        let mut seed: u64 = 12345;
+        let mut rand = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); seed };
+        let bases = [b'A', b'C', b'G', b'T'];
+        let aa_list = b"ACDEFGHIKLMNPQRSTVWY";
+        let tables = crate::tables::make_tables(1).expect("tables");
+
+        let mut nas_buf = Vec::new();
+        let mut aas_buf = Vec::new();
+        let mut params = Vec::new();
+
+        for _ in 0..100 {
+            let nl = 3000; // extension-like size
+            let al = 50;
+            let nas_offset = nas_buf.len() as u32;
+            let aas_offset = aas_buf.len() as u32;
+
+            let mut ns_raw = Vec::with_capacity(nl);
+            for _ in 0..nl { ns_raw.push(bases[(rand() as usize) % 4]); }
+            let mut nas = vec![21u8; nl];
+            let mut codon = 0u8; let mut l = 0i32;
+            for (i, &byte) in ns_raw.iter().enumerate() {
+                let c = tables.nt4[byte as usize];
+                if c < 4 { codon = ((codon << 2) | c) & 0x3f; l += 1; if l >= 3 { nas[i] = tables.codon[codon as usize]; } }
+                else { codon = 0; l = 0; }
+            }
+            nas_buf.extend_from_slice(&nas);
+            let aa: Vec<u8> = (0..al).map(|_| tables.aa20[aa_list[(rand() as usize) % 20] as usize]).collect();
+            aas_buf.extend_from_slice(&aa);
+
+            params.push(DpParams {
+                nas_offset, aas_offset,
+                nl: nl as u32, al: al as u32,
+                go: 11, ge: 1, io: 29, fs: 23, goe: 12,
+                end_bonus: 5, flag: 2, slen: 7, _pad: [0; 3],
+            });
+        }
+
+        // Warmup
+        let _ = batch_dp(&nas_buf, &aas_buf, &params);
+
+        // Timed runs
+        let n_runs = 10;
+        let start = Instant::now();
+        for _ in 0..n_runs {
+            let _ = batch_dp(&nas_buf, &aas_buf, &params);
+        }
+        let elapsed = start.elapsed();
+        let per_dispatch = elapsed / n_runs;
+        let per_call = elapsed / (n_runs * 100);
+        eprintln!(
+            "Metal batch (100 calls × {} runs): {:?} total, {:?}/dispatch, {:?}/call",
+            n_runs, elapsed, per_dispatch, per_call,
+        );
+
+        // CPU comparison
+        let cpu_start = Instant::now();
+        for i in 0..params.len() {
+            let p = &params[i];
+            let ns = &nas_buf[p.nas_offset as usize..(p.nas_offset + p.nl) as usize];
+            let aa = &aas_buf[p.aas_offset as usize..(p.aas_offset + p.al) as usize];
+            let opt = crate::align::NsOpt {
+                flag: 2, go: 11, ge: 1, io: 29, fs: 23, xdrop: 100, end_bonus: 5,
+                sp: [8, 15, 21, 30, 4, 4], sp_null_bonus: -7, ie_coef: 0.5,
+                sc: &crate::tables::BLOSUM62, tables: &tables,
+            };
+            let _ = crate::neon_dp::global_gs16b(ns, aa, &opt, None);
+        }
+        let cpu_elapsed = cpu_start.elapsed();
+        let cpu_per_call = cpu_elapsed / 100;
+        eprintln!("CPU NEON (100 calls): {:?} total, {:?}/call", cpu_elapsed, cpu_per_call);
+        eprintln!("GPU vs CPU per call: {:?} vs {:?}", per_call, cpu_per_call);
+    }
+}
