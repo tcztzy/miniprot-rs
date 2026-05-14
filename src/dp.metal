@@ -28,21 +28,35 @@ kernel void dp_batch(
     bool is_ext=(p.flag&6)!=0;
     if (al>(int)max_al){results[tid]=DpResult{-1,0,0};return;}
 
-    short h3[max_al+1],h2[max_al+1],h1[max_al+1],h0[max_al+1];
-    short d3[max_al+1],d2[max_al+1],d1[max_al+1],d0[max_al+1];
+    short ha[max_al+1],hb[max_al+1],hc[max_al+1],hd[max_al+1];
+    short da[max_al+1],db[max_al+1],dc[max_al+1],dd[max_al+1];
     short h_best[max_al+1];
+    thread short* h3=ha;
+    thread short* h2=hb;
+    thread short* h1=hc;
+    thread short* h0=hd;
+    thread short* d3=da;
+    thread short* d2=db;
+    thread short* d1=dc;
+    thread short* d0=dd;
+    uchar aa_local[max_al];
+    char score_row[max_al];
+    uchar score_nt=255;
 
     for(int j=0;j<=al;j++){h3[j]=NEG;h2[j]=NEG;h1[j]=NEG;d3[j]=NEG;d2[j]=NEG;d1[j]=NEG;}
+    for(int j=0;j<al;j++)aa_local[j]=aas[j];
     h3[0]=0;h2[0]=(short)-p.fs;h1[0]=(short)-p.fs;
 
     int best_sc=(int)NEG, best_sc_log=(int)NEG, best_i=-1;
     const int pen_len=al*3;
 
     for(int i=2;i<nl;i++){
-        for(int j=0;j<=al;j++){h0[j]=NEG;d0[j]=NEG;}
-
         int gei=(nas[i]==AA_STOP)?p.fs:p.ge;
         uchar nt_aa=nas[i];
+        if(nt_aa!=score_nt){
+            for(int j=0;j<al;j++)score_row[j]=mat[nt_aa*22+aa_local[j]];
+            score_nt=nt_aa;
+        }
 
         // Column 0: int arithmetic, store short
         int od0=(int)h3[0]-p.go, ed0=(int)d3[0];
@@ -54,7 +68,7 @@ kernel void dp_batch(
 
         for(int j=0;j<al;j++){
             int col=j+1;
-            int ms=(int)mat[nt_aa*22+aas[j]];
+            int ms=(int)score_row[j];
 
             // All arithmetic in int, store back to short
             int best=(int)h3[j]+ms;
@@ -76,7 +90,7 @@ kernel void dp_batch(
             t=(int)h2[col]-p.fs;if(t>best)best=t;
 
             h0[col]=(short)best;
-            row_max=max(row_max,best);
+            if(is_ext)row_max=max(row_max,best);
         }
 
         if(is_ext){
@@ -99,11 +113,8 @@ kernel void dp_batch(
             if(best_sc_log-tmp_sc_log>100)break;
         }
 
-        for(int j=0;j<=al;j++){
-            short t;
-            t=h3[j];h3[j]=h2[j];h2[j]=h1[j];h1[j]=h0[j];h0[j]=t;
-            t=d3[j];d3[j]=d2[j];d2[j]=d1[j];d1[j]=d0[j];d0[j]=t;
-        }
+        thread short* ht=h3;h3=h2;h2=h1;h1=h0;h0=ht;
+        thread short* dt=d3;d3=d2;d2=d1;d1=d0;d0=dt;
     }
 
     if(is_ext){

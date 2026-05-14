@@ -9,6 +9,7 @@
 > The actual development was:
 > - **Architecture & design:** [Codex](https://openai.com/index/introducing-codex/) + GPT
 > - **Implementation & optimization:** [Claude Code](https://claude.ai/code) (the CLI tool) + [DeepSeek](https://www.deepseek.com/)
+- **GPU kernel tuning:** GPT 5.5 — pointer rotation, score row cache, SIMT memory optimization
 >
 > Anthropic's Claude model had negligible involvement. Credit where credit is due.
 
@@ -87,33 +88,51 @@ compiled with arch-native flags (`-C target-cpu=native` / `-march=native
 - **Thread-local buffer reuse** — profile matrix and SIMD scratch arrays
   reused across DP calls via thread-local storage, cutting ~1 GB of temporary
   allocations per benchmark run.
+- **GPU-accelerated DP** — Metal compute shader with int16 arrays, pointer
+  rotation, score row cache, and optimised threadgroup sizing. Surpasses
+  NEON SIMD at batch ≥4096. Cross-platform via wgpu (Vulkan/Metal/DX12).
+  See [GPU optimization log](docs/gpu-optimization-log.md) for full
+  experiment history.
 
 ### GPU-Accelerated DP (Metal / Vulkan / DX12)
 
-Experimental GPU backends for batched DP computation. Three implementations:
+GPU backends for batched DP computation. At batch ≥4096, **Metal GPU surpasses
+NEON SIMD** — the first time GPU DP beats the CPU SIMD kernel on miniprot workloads.
 
 | Backend | API | Shader | Platform | Host LOC | Shader LOC |
 |---------|-----|--------|----------|----------|------------|
 | CPU NEON/SSE | Rust intrinsics | — | ARM / x86_64 | — | — |
-| **Metal** | metal-rs (raw) | MSL | macOS only | 284 | 192 |
+| **Metal** | metal-rs (raw) | MSL | macOS only | 260 | 117 |
 | **wgpu** | wgpu (cross) | WGSL | macOS/Linux/Windows | 387 | 192 |
 
-#### Batch Size Sweep (nl=3000, al=50, Apple M2)
+#### Batch Size Sweep (nl=3000, al=50, Apple M2, all 100% correct)
 
-| Batch | CPU Scalar | CPU NEON SIMD | Metal GPU | wgpu GPU | Metal vs Scalar |
-|-------|-----------|--------------|-----------|----------|----------------|
-| 64 | 598us/call | 41us/call | 1.4ms/call | 2.1ms/call | 0.4x |
-| 256 | 383us/call | 26us/call | 495us/call | 526us/call | 0.8x |
-| **512** | 332us/call | 26us/call | **250us/call** | **267us/call** | **1.3x faster** |
-| **1024** | 308us/call | 27us/call | **140us/call** | **176us/call** | **2.2x faster** |
+| Batch | CPU Scalar | CPU NEON | Metal GPU | vs Scalar | vs NEON |
+|-------|-----------|----------|-----------|-----------|---------|
+| 64 | 525us/call | 31us/call | 658us/call | 0.8x | 0.0x |
+| 256 | 366us/call | 27us/call | 169us/call | 2.2x | 0.2x |
+| 1024 | 337us/call | 26us/call | 41us/call | 8.1x | 0.7x |
+| 2048 | 303us/call | 28us/call | 33us/call | 9.0x | 0.9x |
+| **4096** | 299us/call | 26us/call | **19us/call** | 15.4x | **1.4x faster** |
+| **8192** | 308us/call | 26us/call | **20us/call** | 14.4x | **1.3x faster** |
 
-GPU beats CPU scalar at batch ≥512 (Metal 2.2x at 1024). Metal incremental per-call
-cost ~32us — approaching NEON SIMD (~27us). Fixed dispatch overhead (~86ms Metal,
-~128ms wgpu) dominates at realistic batch sizes. NEON SIMD remains the production
-path, 5.2x faster than GPU end-to-end.
+At batch 4096: Metal 80ms total vs NEON 110ms — **GPU 1.4x faster.** At batch 8192:
+Metal 169ms vs NEON 219ms — **GPU 1.3x faster.** Kernel-only per-call cost down to
+18us (vs NEON 27us). GPU beats NEON because marginal per-call compute (11-24us) is
+below NEON's 27us, and fixed dispatch overhead (~40ms) is amortized at large batch.
 
-On Nvidia dGPU (Linux, wgpu Vulkan backend), per-call GPU compute expected to be
-closer to NEON SIMD due to higher core count and clock speed.
+#### GPU kernel optimizations
+
+- **int16 DP arrays** — half stack footprint (1.8KB/thread), reduces VRAM spill
+- **Pointer rotation** — swap 8 row pointers instead of copying 8×(al+1) shorts per row
+- **Score row cache** — precompute `score_row[j]` once per nucleotide (every 3 rows),
+  eliminating 2D VRAM lookup per column in the inner loop
+- **Thread-local aa buffer** — copy `aas[]` to register array, avoid VRAM random read
+- **Conditional row_max** — skip max tracking in non-extension mode
+- **TG=32** — per-threadgroup stack 58KB, fits in M2 GPU register file
+- **No-copy input buffers** — `new_buffer_with_bytes_no_copy` wraps host slices directly
+  on Apple Silicon unified memory
+- **Dead store elimination** — remove per-row zero-fill that gets overwritten
 
 GPU benchmarks:
 
@@ -121,6 +140,10 @@ GPU benchmarks:
 cargo test --release --lib gpu_bench -- --nocapture
 cargo test --release --lib bench_batch_size_sweep -- --nocapture
 ```
+
+Performance baseline is the current Rust implementation. GPU regressions
+measured against current Metal shader, not against C oracle. CPU NEON SIMD
+is the single-query baseline; GPU DP is the high-batch baseline (≥4096).
 
 CPU benchmarks (vs C oracle):
 

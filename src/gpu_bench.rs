@@ -67,9 +67,7 @@ fn generate_workload(
         ns_raw.push(ns);
 
         // Generate raw amino acid sequence
-        let aa: Vec<u8> = (0..al)
-            .map(|_| aa_chars[(rng() as usize) % 20])
-            .collect();
+        let aa: Vec<u8> = (0..al).map(|_| aa_chars[(rng() as usize) % 20]).collect();
         let aas: Vec<u8> = aa.iter().map(|&byte| tables.aa20[byte as usize]).collect();
         aas_buf.extend_from_slice(&aas);
         aa_raw.push(aa);
@@ -224,8 +222,7 @@ fn run_wgpu_batch(data: &BenchData, _n_repeats: usize) -> Option<BenchResult> {
         return None;
     }
     let start = Instant::now();
-    let results =
-        crate::wgpu_dp::batch_dp(&data.nas_buf, &data.aas_buf, &data.params)?;
+    let results = crate::wgpu_dp::batch_dp(&data.nas_buf, &data.aas_buf, &data.params)?;
     let total = start.elapsed();
     let n = data.params.len();
     Some(BenchResult {
@@ -237,16 +234,17 @@ fn run_wgpu_batch(data: &BenchData, _n_repeats: usize) -> Option<BenchResult> {
     })
 }
 
-fn check_correctness(cpu: &[DpResult], gpu: &[DpResult], tolerance: i32) -> (usize, usize, Vec<String>) {
+fn check_correctness(
+    cpu: &[DpResult],
+    gpu: &[DpResult],
+    tolerance: i32,
+) -> (usize, usize, Vec<String>) {
     let mut ok = 0;
     let mut diff = 0;
     let mut diffs = Vec::new();
     for (i, (c, g)) in cpu.iter().zip(gpu.iter()).enumerate() {
         let sc_diff = (c.score - g.score).abs();
-        if sc_diff <= tolerance
-            && c.nt_len == g.nt_len
-            && c.aa_len == g.aa_len
-        {
+        if sc_diff <= tolerance && c.nt_len == g.nt_len && c.aa_len == g.aa_len {
             ok += 1;
         } else {
             diff += 1;
@@ -438,7 +436,7 @@ fn bench_extension_mode() {
 
 #[test]
 fn bench_kernel_only() {
-    eprintln!("\n=== Kernel-Only Time (batch=256, nl=3000, al=50) ===");
+    eprintln!("\n=== Kernel-Only Time (nl=3000, al=50) ===");
     let mut seed: u64 = 11111;
     let mut rng = || {
         seed = seed
@@ -447,38 +445,43 @@ fn bench_kernel_only() {
         seed
     };
 
-    let data = generate_workload(256, 3000, 50, false, &mut rng);
+    for &bs in &[256, 1024, 4096, 8192] {
+        eprintln!("\n--- Batch size: {bs} ---");
+        let data = generate_workload(bs, 3000, 50, false, &mut rng);
 
-    // Metal kernel-only
-    if let Some((warmup, timed)) = metal_dp::bench_dispatch_only(
-        &data.nas_buf,
-        &data.aas_buf,
-        &data.params,
-        &crate::tables::BLOSUM62,
-    ) {
-        eprintln!(
-            "  Metal kernel: warmup={}, timed={}",
-            format_dur(warmup),
-            format_dur(timed)
-        );
-    } else {
-        eprintln!("  Metal kernel: not available");
-    }
+        if let Some((warmup, timed)) = metal_dp::bench_dispatch_only(
+            &data.nas_buf,
+            &data.aas_buf,
+            &data.params,
+            &crate::tables::BLOSUM62,
+        ) {
+            eprintln!(
+                "  Metal kernel: warmup={}, timed={}, {}/call",
+                format_dur(warmup),
+                format_dur(timed),
+                format_dur(timed / bs as u32)
+            );
+        } else {
+            eprintln!("  Metal kernel: not available");
+        }
 
-    // wgpu kernel-only
-    if let Some((warmup, timed)) = crate::wgpu_dp::bench_dispatch_only(
-        &data.nas_buf,
-        &data.aas_buf,
-        &data.params,
-        &crate::tables::BLOSUM62,
-    ) {
-        eprintln!(
-            "  wgpu kernel:  warmup={}, timed={}",
-            format_dur(warmup),
-            format_dur(timed)
-        );
-    } else {
-        eprintln!("  wgpu kernel:  not available");
+        if bs <= 4096 {
+            if let Some((warmup, timed)) = crate::wgpu_dp::bench_dispatch_only(
+                &data.nas_buf,
+                &data.aas_buf,
+                &data.params,
+                &crate::tables::BLOSUM62,
+            ) {
+                eprintln!(
+                    "  wgpu kernel:  warmup={}, timed={}, {}/call",
+                    format_dur(warmup),
+                    format_dur(timed),
+                    format_dur(timed / bs as u32)
+                );
+            } else {
+                eprintln!("  wgpu kernel:  not available");
+            }
+        }
     }
 }
 
@@ -505,14 +508,23 @@ fn bench_metal_vs_scalar_large() {
 
         let (scalar_results, scalar_time) = run_cpu_scalar(&data, false);
         let (_neon_res, neon_time) = run_cpu_neon(&data, false);
-        eprintln!("  CPU scalar: {} total, {}/call", format_dur(scalar_time), format_dur(scalar_time / bs as u32));
-        eprintln!("  CPU NEON:   {} total, {}/call", format_dur(neon_time), format_dur(neon_time / bs as u32));
+        eprintln!(
+            "  CPU scalar: {} total, {}/call",
+            format_dur(scalar_time),
+            format_dur(scalar_time / bs as u32)
+        );
+        eprintln!(
+            "  CPU NEON:   {} total, {}/call",
+            format_dur(neon_time),
+            format_dur(neon_time / bs as u32)
+        );
 
         if let Some(br) = run_metal_batch(&data, 1) {
             let (ok, _, _) = check_correctness(&scalar_results, &br.results, 2);
             eprintln!(
                 "  Metal:      {} total, {}/call  [ok:{ok}/{bs}]  {:.1}x CPU scalar  {:.1}x CPU NEON",
-                format_dur(br.total), format_dur(br.per_call),
+                format_dur(br.total),
+                format_dur(br.per_call),
                 scalar_time.as_secs_f64() / br.total.as_secs_f64().max(1e-9),
                 neon_time.as_secs_f64() / br.total.as_secs_f64().max(1e-9),
             );

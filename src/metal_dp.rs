@@ -6,9 +6,9 @@
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use std::sync::Mutex;
     use metal::*;
     use objc::rc::autoreleasepool;
+    use std::sync::Mutex;
 
     /// Must match dp.metal DpParams exactly (48 bytes, 4-byte aligned).
     #[repr(C)]
@@ -74,11 +74,7 @@ mod imp {
     }
 
     /// Run batched DP with default BLOSUM62 matrix.
-    pub fn batch_dp(
-        nas_buf: &[u8],
-        aas_buf: &[u8],
-        params: &[DpParams],
-    ) -> Option<Vec<DpResult>> {
+    pub fn batch_dp(nas_buf: &[u8], aas_buf: &[u8], params: &[DpParams]) -> Option<Vec<DpResult>> {
         batch_dp_with_matrix(nas_buf, aas_buf, params, &crate::tables::BLOSUM62)
     }
 
@@ -100,25 +96,27 @@ mod imp {
 
         autoreleasepool(|| {
             let opts = MTLResourceOptions::StorageModeShared;
-            let nas_gpu = state.device.new_buffer_with_data(
+            let nas_gpu = state.device.new_buffer_with_bytes_no_copy(
                 nas_buf.as_ptr() as *const std::ffi::c_void,
                 nas_buf.len() as u64,
                 opts,
+                None,
             );
-            let aas_gpu = state.device.new_buffer_with_data(
+            let aas_gpu = state.device.new_buffer_with_bytes_no_copy(
                 aas_buf.as_ptr() as *const std::ffi::c_void,
                 aas_buf.len() as u64,
                 opts,
+                None,
             );
-            let params_gpu = state.device.new_buffer_with_data(
+            let params_gpu = state.device.new_buffer_with_bytes_no_copy(
                 params.as_ptr() as *const std::ffi::c_void,
                 params.len() as u64 * std::mem::size_of::<DpParams>() as u64,
                 opts,
+                None,
             );
-            let results_gpu = state.device.new_buffer(
-                n * std::mem::size_of::<DpResult>() as u64,
-                opts,
-            );
+            let results_gpu = state
+                .device
+                .new_buffer(n * std::mem::size_of::<DpResult>() as u64, opts);
             let matrix_gpu = state.device.new_buffer_with_data(
                 flat_matrix.as_ptr() as *const std::ffi::c_void,
                 std::mem::size_of_val(&flat_matrix) as u64,
@@ -134,10 +132,7 @@ mod imp {
             enc.set_buffer(3, Some(&results_gpu), 0);
             enc.set_buffer(4, Some(&matrix_gpu), 0);
 
-            let tg = state
-                .pipeline
-                .max_total_threads_per_threadgroup()
-                .min(64);
+            let tg = state.pipeline.max_total_threads_per_threadgroup().min(32);
             enc.dispatch_threads(MTLSize::new(n, 1, 1), MTLSize::new(tg, 1, 1));
             enc.end_encoding();
 
@@ -167,25 +162,27 @@ mod imp {
 
         autoreleasepool(|| {
             let opts = MTLResourceOptions::StorageModeShared;
-            let nas_gpu = state.device.new_buffer_with_data(
+            let nas_gpu = state.device.new_buffer_with_bytes_no_copy(
                 nas_buf.as_ptr() as *const std::ffi::c_void,
                 nas_buf.len() as u64,
                 opts,
+                None,
             );
-            let aas_gpu = state.device.new_buffer_with_data(
+            let aas_gpu = state.device.new_buffer_with_bytes_no_copy(
                 aas_buf.as_ptr() as *const std::ffi::c_void,
                 aas_buf.len() as u64,
                 opts,
+                None,
             );
-            let params_gpu = state.device.new_buffer_with_data(
+            let params_gpu = state.device.new_buffer_with_bytes_no_copy(
                 params.as_ptr() as *const std::ffi::c_void,
                 params.len() as u64 * std::mem::size_of::<DpParams>() as u64,
                 opts,
+                None,
             );
-            let results_gpu = state.device.new_buffer(
-                n * std::mem::size_of::<DpResult>() as u64,
-                opts,
-            );
+            let results_gpu = state
+                .device
+                .new_buffer(n * std::mem::size_of::<DpResult>() as u64, opts);
             let matrix_gpu = state.device.new_buffer_with_data(
                 flat_matrix.as_ptr() as *const std::ffi::c_void,
                 std::mem::size_of_val(&flat_matrix) as u64,
@@ -201,10 +198,7 @@ mod imp {
                 enc.set_buffer(2, Some(&params_gpu), 0);
                 enc.set_buffer(3, Some(&results_gpu), 0);
                 enc.set_buffer(4, Some(&matrix_gpu), 0);
-                let tg = state
-                    .pipeline
-                    .max_total_threads_per_threadgroup()
-                    .min(64);
+                let tg = state.pipeline.max_total_threads_per_threadgroup().min(32);
                 enc.dispatch_threads(MTLSize::new(n, 1, 1), MTLSize::new(tg, 1, 1));
                 enc.end_encoding();
                 cb.commit();
@@ -235,17 +229,48 @@ mod imp {
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct DpParams {
-        pub nas_offset: u32, pub aas_offset: u32, pub nl: u32, pub al: u32,
-        pub go: i32, pub ge: i32, pub io: i32, pub fs: i32,
-        pub goe: i32, pub end_bonus: i32, pub flag: i32, pub slen: u32,
+        pub nas_offset: u32,
+        pub aas_offset: u32,
+        pub nl: u32,
+        pub al: u32,
+        pub go: i32,
+        pub ge: i32,
+        pub io: i32,
+        pub fs: i32,
+        pub goe: i32,
+        pub end_bonus: i32,
+        pub flag: i32,
+        pub slen: u32,
     }
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
-    pub struct DpResult { pub score: i32, pub nt_len: i32, pub aa_len: i32 }
-    pub fn available() -> bool { false }
-    pub fn batch_dp(_nas: &[u8], _aas: &[u8], _params: &[DpParams]) -> Option<Vec<DpResult>> { None }
-    pub fn batch_dp_with_matrix(_nas: &[u8], _aas: &[u8], _params: &[DpParams], _matrix: &[[i8; 22]; 22]) -> Option<Vec<DpResult>> { None }
-    pub fn bench_dispatch_only(_nas: &[u8], _aas: &[u8], _params: &[DpParams], _matrix: &[[i8; 22]; 22]) -> Option<(std::time::Duration, std::time::Duration)> { None }
+    pub struct DpResult {
+        pub score: i32,
+        pub nt_len: i32,
+        pub aa_len: i32,
+    }
+    pub fn available() -> bool {
+        false
+    }
+    pub fn batch_dp(_nas: &[u8], _aas: &[u8], _params: &[DpParams]) -> Option<Vec<DpResult>> {
+        None
+    }
+    pub fn batch_dp_with_matrix(
+        _nas: &[u8],
+        _aas: &[u8],
+        _params: &[DpParams],
+        _matrix: &[[i8; 22]; 22],
+    ) -> Option<Vec<DpResult>> {
+        None
+    }
+    pub fn bench_dispatch_only(
+        _nas: &[u8],
+        _aas: &[u8],
+        _params: &[DpParams],
+        _matrix: &[[i8; 22]; 22],
+    ) -> Option<(std::time::Duration, std::time::Duration)> {
+        None
+    }
 }
 #[cfg(not(target_os = "macos"))]
 pub(crate) use imp::*;

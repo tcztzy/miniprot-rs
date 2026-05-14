@@ -249,12 +249,96 @@ GPU 追平 NEON 的理论条件：
 
 ---
 
+## 实验 9：指针轮转替代整行拷贝
+
+### 假设
+
+旧 shader 每个 nucleotide row 末尾执行：
+
+```
+h3 <- h2 <- h1 <- h0
+d3 <- d2 <- d1 <- d0
+```
+
+实现方式是对 `0..=al` 每列拷贝 8 个 `short`。对 `nl=3000, al=50`，每个 DP call 约 120 万次 thread-local load/store，仅用于轮转。改为 `thread short*` 指针轮转可以保留 4 组数组，但每行只交换 8 个指针。
+
+同时删除 `h0/d0` 每行初始化：当前行所有 `0..=al` 元素都会被覆盖，清零/填 `NEG` 是死写。
+
+### 结果
+
+`bench_kernel_only` batch 256：
+
+```
+改前: 91.82ms
+改后: 48.07ms
+提升: 1.91x
+```
+
+完整 batch sweep 中，Metal 8192 从 589ms 降到约 272ms，已经从 0.37x NEON 提升到约 0.9x NEON，但仍未稳定超过 NEON。
+
+---
+
+## 实验 10：no-copy 输入 buffer
+
+### 假设
+
+`new_buffer_with_data` 会把 `nas/aas/params` 复制进新的 Metal buffer。8192 batch 下 `nas` 约 24.6MB，host 侧 buffer 创建和复制占明显时间。Apple Silicon 统一内存允许用 `new_buffer_with_bytes_no_copy` 直接包装只读输入 slice；command buffer 同步等待完成，slice 生命周期覆盖 GPU 读取。
+
+### 结果
+
+完整 batch 8192：
+
+```
+copy input:    271.92ms
+no-copy input: 258.29ms
+```
+
+no-copy 单独不足以超过 NEON，但减少约 14ms host 开销。
+
+---
+
+## 实验 11：局部缓存 aas 和当前 score row，TG=32
+
+### 假设
+
+no-copy 后，shader 内层循环每个 cell 都从 host-backed `aas[j]` 读取 amino-acid code，并访问 `mat[nt_aa*22+aas[j]]`。`aas` 对每个 DP call 固定，`nt_aa` 在当前纯 A 测试里几乎恒定。
+
+实现：
+
+- 每个 thread 启动时把 `aas[0..al]` 缓存到 `uchar aa_local[max_al]`
+- 缓存当前 `nt_aa` 的 `char score_row[max_al]`，仅当 `nt_aa` 改变时重建
+- 重新 sweep threadgroup size；局部缓存后 `TG=32` 最优，`TG=64/128` 都更慢
+
+### Kernel-only 结果
+
+```
+Batch   Metal kernel
+256     40.07ms  (156us/call)
+1024    40.16ms  (39us/call)
+4096    67.30ms  (16us/call)
+8192    153.03ms (18us/call)
+```
+
+### End-to-end 结果
+
+```
+Batch   CPU scalar       CPU NEON        Metal final      vs Scalar   vs NEON
+4096    1.23s(299us)    110.46ms(26us)  86.81ms(21us)   14.1x       1.3x
+8192    2.48s(302us)    224.47ms(27us)  199.39ms(24us)  12.4x       1.1x
+```
+
+Metal 首次在该 benchmark 上超过 NEON SIMD。正确性：`4096/4096`、`8192/8192` 与 scalar 匹配。
+
+注意：`score_row` 缓存对当前纯 A benchmark 特别有效，因为 translated `nt_aa` 长段重复；真实序列收益取决于 `nt_aa` 局部重复程度。`aa_local` 和指针轮转是通用收益。
+
+---
+
 ## 最终架构
 
 ```
-src/dp.metal       — Metal int16 标量 DP shader (170 行, MAX_AL=128)
+src/dp.metal       — Metal int16 标量 DP shader (MAX_AL=128, pointer rotation, aa/score-row cache)
 src/dp.wgsl        — wgpu WGSL 标量 DP shader (192 行, MAX_AL=128)
-src/metal_dp.rs    — Metal host dispatch (240 行, TG=64)
+src/metal_dp.rs    — Metal host dispatch (no-copy input buffers, TG=32)
 src/wgpu_dp.rs     — wgpu host dispatch (387 行)
 src/gpu_bench.rs   — 综合 benchmark (CPU scalar + NEON + Metal + wgpu, batch 1-8192)
 ```
@@ -275,5 +359,8 @@ src/gpu_bench.rs   — 综合 benchmark (CPU scalar + NEON + Metal + wgpu, batch
 | 6 | **int16** | ✓ | 125ms | 134ms | **266ms** | 大 batch +91% |
 | 7 | **TG 64** | ✓ | **91ms** | **129ms** | **220ms** | 全面最优 +30% |
 | — | **6+7 combined** | ✓ | **91ms** | **129ms** | **220ms** | **大 batch +130%** |
+| 9 | 指针轮转 + 去死写 | ✓ | **45ms** | **68ms** | **132ms** | 接近 NEON |
+| 10 | no-copy 输入 | ✓ | **47ms** | **66ms** | **127ms** | host 开销下降 |
+| 11 | aa/score-row cache + TG32 | ✓ | **43ms** | **46ms** | **87ms** | **超过 NEON** |
 
-CPU NEON SIMD 始终最优：26us/call，batch 8192 只需 218ms（GPU 589ms，差 2.7x）。
+当前最佳 Metal 在该 benchmark 上超过 CPU NEON SIMD：batch 4096 为 86.81ms vs NEON 110.46ms，batch 8192 为 199.39ms vs NEON 224.47ms。
