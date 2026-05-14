@@ -88,7 +88,41 @@ compiled with arch-native flags (`-C target-cpu=native` / `-march=native
   reused across DP calls via thread-local storage, cutting ~1 GB of temporary
   allocations per benchmark run.
 
-Reproduce with:
+### GPU-Accelerated DP (Metal / Vulkan / DX12)
+
+Experimental GPU backends for batched DP computation. Three implementations:
+
+| Backend | API | Shader | Platform | Host LOC | Shader LOC |
+|---------|-----|--------|----------|----------|------------|
+| CPU NEON/SSE | Rust intrinsics | — | ARM / x86_64 | — | — |
+| **Metal** | metal-rs (raw) | MSL | macOS only | 284 | 192 |
+| **wgpu** | wgpu (cross) | WGSL | macOS/Linux/Windows | 387 | 192 |
+
+#### Batch Size Sweep (nl=3000, al=50, Apple M2)
+
+| Batch | CPU Scalar | CPU NEON SIMD | Metal GPU | wgpu GPU | Metal vs Scalar |
+|-------|-----------|--------------|-----------|----------|----------------|
+| 64 | 598us/call | 41us/call | 1.4ms/call | 2.1ms/call | 0.4x |
+| 256 | 383us/call | 26us/call | 495us/call | 526us/call | 0.8x |
+| **512** | 332us/call | 26us/call | **250us/call** | **267us/call** | **1.3x faster** |
+| **1024** | 308us/call | 27us/call | **140us/call** | **176us/call** | **2.2x faster** |
+
+GPU beats CPU scalar at batch ≥512 (Metal 2.2x at 1024). Metal incremental per-call
+cost ~32us — approaching NEON SIMD (~27us). Fixed dispatch overhead (~86ms Metal,
+~128ms wgpu) dominates at realistic batch sizes. NEON SIMD remains the production
+path, 5.2x faster than GPU end-to-end.
+
+On Nvidia dGPU (Linux, wgpu Vulkan backend), per-call GPU compute expected to be
+closer to NEON SIMD due to higher core count and clock speed.
+
+GPU benchmarks:
+
+```bash
+cargo test --release --lib gpu_bench -- --nocapture
+cargo test --release --lib bench_batch_size_sweep -- --nocapture
+```
+
+CPU benchmarks (vs C oracle):
 
 ```bash
 # index build

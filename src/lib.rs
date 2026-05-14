@@ -13,6 +13,7 @@ mod neon_dp;
 mod scalar_dp;
 mod sse_dp;
 mod seqdb;
+mod wgpu_dp;
 
 mod sketch;
 mod sort;
@@ -72,5 +73,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
+#[cfg(test)]
+mod gpu_bench;
 #[cfg(test)]
 mod tests;
