@@ -1,5 +1,17 @@
 # miniprot (Rust port)
 
+> [!NOTE]
+> **AI Attribution:** The git history shows "Claude" in commit trailers, but this
+> naming is an artifact of how [Claude Code](https://github.com/anthropics/claude-code)
+> (the CLI tool) formats its `Co-Authored-By` lines — it hardcodes a reference to
+> Anthropic's Claude model family.
+>
+> The actual development was:
+> - **Architecture & design:** [Codex](https://openai.com/index/introducing-codex/) + GPT
+> - **Implementation & optimization:** [Claude Code](https://claude.ai/code) (the CLI tool) + [DeepSeek](https://www.deepseek.com/)
+>
+> Anthropic's Claude model had negligible involvement. Credit where credit is due.
+
 This project is a Rust port of [`lh3/miniprot`](https://github.com/lh3/miniprot).
 
 However, it is not a trivial rewrite of the original C code, and certainly not an AI-generated line-by-line translation of the upstream repository. In this port, I intentionally removed many legacy C patterns and favored implementations that are more direct, maintainable, and idiomatic in Rust.
