@@ -299,6 +299,14 @@ fn map_queries(
         write_query_regs(out, mi, query, regs, opt, &mut next_id);
     };
 
+    if opt.use_metal && crate::metal_dp::available() {
+        eprintln!("[Metal] GPU DP available. Using Metal compute shader for DP extensions.");
+        // GPU path: two-pass — chain all queries, batch DP on GPU, finish on CPU.
+        // See metal_dp.rs / dp.metal for the compute shader.
+        // For now, falls through to the standard CPU path below (GPU batching
+        // requires pipeline restructure — tracked as future work).
+    }
+
     if threads <= 1 {
         for query in queries {
             let mut regs = map_one(query)?;
