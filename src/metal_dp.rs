@@ -137,7 +137,7 @@ mod imp {
             let tg = state
                 .pipeline
                 .max_total_threads_per_threadgroup()
-                .min(256);
+                .min(64);
             enc.dispatch_threads(MTLSize::new(n, 1, 1), MTLSize::new(tg, 1, 1));
             enc.end_encoding();
 
@@ -204,7 +204,7 @@ mod imp {
                 let tg = state
                     .pipeline
                     .max_total_threads_per_threadgroup()
-                    .min(256);
+                    .min(64);
                 enc.dispatch_threads(MTLSize::new(n, 1, 1), MTLSize::new(tg, 1, 1));
                 enc.end_encoding();
                 cb.commit();

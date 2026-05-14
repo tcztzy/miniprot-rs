@@ -276,7 +276,7 @@ fn bench_batch_size_sweep() {
         seed
     };
 
-    let batch_sizes = [1, 4, 16, 64, 256, 512, 1024];
+    let batch_sizes = [1, 4, 16, 64, 256, 512, 1024, 2048, 4096, 8192];
 
     for &bs in &batch_sizes {
         eprintln!("\n--- Batch size: {bs} ---");
