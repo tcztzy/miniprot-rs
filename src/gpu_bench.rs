@@ -234,6 +234,23 @@ fn run_wgpu_batch(data: &BenchData, _n_repeats: usize) -> Option<BenchResult> {
     })
 }
 
+fn run_cuda_batch(data: &BenchData, _n_repeats: usize) -> Option<BenchResult> {
+    if !crate::cuda_dp::available() {
+        return None;
+    }
+    let start = Instant::now();
+    let results = crate::cuda_dp::batch_dp(&data.nas_buf, &data.aas_buf, &data.params)?;
+    let total = start.elapsed();
+    let n = data.params.len();
+    Some(BenchResult {
+        name: "CUDA".into(),
+        n_calls: n,
+        total,
+        per_call: total / n as u32,
+        results,
+    })
+}
+
 fn check_correctness(
     cpu: &[DpResult],
     gpu: &[DpResult],
@@ -324,6 +341,19 @@ fn bench_batch_size_sweep() {
         } else {
             eprintln!("  wgpu:       n/a");
         }
+
+        if let Some(br) = run_cuda_batch(&data, 1) {
+            let (ok, _, _) = check_correctness(&scalar_results, &br.results, 2);
+            eprintln!(
+                "  CUDA:       {} total, {}/call  [match:{ok}/{bs}]  {:.1}x CPU scalar,  {:.1}x CPU NEON",
+                format_dur(br.total),
+                format_dur(br.per_call),
+                scalar_time.as_secs_f64() / br.total.as_secs_f64().max(1e-9),
+                neon_time.as_secs_f64() / br.total.as_secs_f64().max(1e-9),
+            );
+        } else {
+            eprintln!("  CUDA:       n/a");
+        }
     }
 }
 
@@ -352,7 +382,7 @@ fn bench_matrix_size_sweep() {
 
         let (cpu_results, cpu_time) = run_cpu_scalar(&data, false);
         eprintln!(
-            "  CPU NEON:  {} total, {}/call",
+            "  CPU scalar:{} total, {}/call",
             format_dur(cpu_time),
             format_dur(cpu_time / 64)
         );
@@ -380,6 +410,18 @@ fn bench_matrix_size_sweep() {
         } else {
             eprintln!("  wgpu:      not available");
         }
+
+        if let Some(br) = run_cuda_batch(&data, 1) {
+            let (ok, diff, _) = check_correctness(&cpu_results, &br.results, 2);
+            let speedup = cpu_time.as_secs_f64() / br.total.as_secs_f64();
+            eprintln!(
+                "  CUDA:      {} total, {}/call  [{ok}/{diff} match, {speedup:.1}x vs CPU]",
+                format_dur(br.total),
+                format_dur(br.per_call),
+            );
+        } else {
+            eprintln!("  CUDA:      not available");
+        }
     }
 }
 
@@ -398,7 +440,7 @@ fn bench_extension_mode() {
 
     let (cpu_results, cpu_time) = run_cpu_scalar(&data, true);
     eprintln!(
-        "  CPU NEON:  {} total, {}/call",
+        "  CPU scalar:{} total, {}/call",
         format_dur(cpu_time),
         format_dur(cpu_time / 64)
     );
@@ -431,6 +473,21 @@ fn bench_extension_mode() {
         }
     } else {
         eprintln!("  wgpu:      not available");
+    }
+
+    if let Some(br) = run_cuda_batch(&data, 1) {
+        let (ok, diff, diffs) = check_correctness(&cpu_results, &br.results, 5);
+        let speedup = cpu_time.as_secs_f64() / br.total.as_secs_f64();
+        eprintln!(
+            "  CUDA:      {} total, {}/call  [{ok}/{diff} match, {speedup:.1}x vs CPU]",
+            format_dur(br.total),
+            format_dur(br.per_call),
+        );
+        for d in &diffs {
+            eprintln!("{d}");
+        }
+    } else {
+        eprintln!("  CUDA:      not available");
     }
 }
 
@@ -482,6 +539,22 @@ fn bench_kernel_only() {
                 eprintln!("  wgpu kernel:  not available");
             }
         }
+
+        if let Some((warmup, timed)) = crate::cuda_dp::bench_dispatch_only(
+            &data.nas_buf,
+            &data.aas_buf,
+            &data.params,
+            &crate::tables::BLOSUM62,
+        ) {
+            eprintln!(
+                "  CUDA kernel:  warmup={}, timed={}, {}/call",
+                format_dur(warmup),
+                format_dur(timed),
+                format_dur(timed / bs as u32)
+            );
+        } else {
+            eprintln!("  CUDA kernel:  not available");
+        }
     }
 }
 
@@ -531,6 +604,19 @@ fn bench_metal_vs_scalar_large() {
         } else {
             eprintln!("  Metal:      n/a");
         }
+
+        if let Some(br) = run_cuda_batch(&data, 1) {
+            let (ok, _, _) = check_correctness(&scalar_results, &br.results, 2);
+            eprintln!(
+                "  CUDA:       {} total, {}/call  [ok:{ok}/{bs}]  {:.1}x CPU scalar  {:.1}x CPU NEON",
+                format_dur(br.total),
+                format_dur(br.per_call),
+                scalar_time.as_secs_f64() / br.total.as_secs_f64().max(1e-9),
+                neon_time.as_secs_f64() / br.total.as_secs_f64().max(1e-9),
+            );
+        } else {
+            eprintln!("  CUDA:       n/a");
+        }
     }
 }
 
@@ -543,15 +629,20 @@ fn report_code_metrics() {
     let metal_shader = include_str!("dp.metal");
     let wgpu_host = include_str!("wgpu_dp.rs");
     let wgpu_shader = include_str!("dp.wgsl");
+    let cuda_host = include_str!("cuda_dp.rs");
+    let cuda_kernel = include_str!("cuda_dp.cu");
 
     let metal_host_loc = metal_host.lines().count();
     let metal_shader_loc = metal_shader.lines().count();
     let wgpu_host_loc = wgpu_host.lines().count();
     let wgpu_shader_loc = wgpu_shader.lines().count();
+    let cuda_host_loc = cuda_host.lines().count();
+    let cuda_kernel_loc = cuda_kernel.lines().count();
 
     // Count unsafe blocks
     let metal_unsafe = metal_host.matches("unsafe").count();
     let wgpu_unsafe = wgpu_host.matches("unsafe").count();
+    let cuda_unsafe = cuda_host.matches("unsafe").count();
 
     // Count API interaction points (simplified: count lines with common patterns)
     let metal_api_calls = metal_host
@@ -597,16 +688,22 @@ fn report_code_metrics() {
         "  wgpu (cross)  | {:>8} | {:>10} | {:>6} | {:>8}",
         wgpu_host_loc, wgpu_shader_loc, wgpu_unsafe, wgpu_api_calls
     );
+    eprintln!(
+        "  CUDA (raw)    | {:>8} | {:>10} | {:>6} | {:>8}",
+        cuda_host_loc, cuda_kernel_loc, cuda_unsafe, "FFI"
+    );
 
     // Dependency count
     eprintln!();
     eprintln!("  Dependencies added:");
     eprintln!("    Metal:  metal, objc (2 crates)");
     eprintln!("    wgpu:   wgpu, bytemuck, pollster (3 crates)");
+    eprintln!("    CUDA:   no Rust crates; requires CUDA toolkit at build time");
 
     // Platform support
     eprintln!();
     eprintln!("  Platform support:");
     eprintln!("    Metal:  macOS only (ARM + x86_64), no Linux/Windows");
     eprintln!("    wgpu:   macOS (Metal), Linux (Vulkan), Windows (DX12/Vulkan)");
+    eprintln!("    CUDA:   NVIDIA GPUs, opt-in with --features cuda");
 }

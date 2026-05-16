@@ -1,6 +1,7 @@
 mod align;
 mod chain;
 mod cli;
+mod cuda_dp;
 mod fastx;
 mod format;
 mod hit;

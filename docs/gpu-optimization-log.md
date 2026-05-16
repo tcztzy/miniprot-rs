@@ -333,14 +333,83 @@ Metal 首次在该 benchmark 上超过 NEON SIMD。正确性：`4096/4096`、`81
 
 ---
 
+## 实验 12：H800 CUDA 后端
+
+### 目标
+
+把最终 Metal 标量 kernel 的形状移植到 NVIDIA H800：一条 GPU thread 处理一个 DP call，保留 `int16` DP rows、指针轮转、`aa_local` 和 `score_row` 局部缓存。CUDA 后端通过 `--features cuda` 显式启用，Linux 上用 `build.rs` 调 `nvcc` 构建 `src/cuda_dp.cu`。
+
+远端环境：
+
+```
+GPU: NVIDIA H800 PCIe, compute capability 9.0
+CUDA: /usr/local/cuda-12.8
+Rust: rustc 1.95.0
+```
+
+### Block size sweep
+
+H800 上小 block 仍然最优。每个 thread 的 local arrays 较大，32 threads/block 比 64 更稳，尤其在 8192 batch。
+
+```
+Threads/block   Batch 256   Batch 1024   Batch 4096   Batch 8192
+32              9.69ms      9.70ms       9.75ms       10.71ms
+64              9.77ms      9.80ms       9.79ms       12.87ms
+128             12.51ms     12.80ms      13.09ms      14.98ms
+256             26.11ms     27.47ms      28.44ms      28.32ms
+512             26.05ms     45.15ms      45.40ms      45.38ms
+```
+
+结论：CUDA 默认 `CUDA_THREADS=32`。仍可用环境变量覆盖。
+
+### End-to-end batch sweep
+
+测试用例同 Metal：`nl=3000, al=50, ext=false`。H800 主机是 x86_64，benchmark 行名仍显示 `CPU NEON`，这里按 CPU SIMD baseline 理解。
+
+```
+Batch   CPU scalar       CPU SIMD        CUDA(H800)     正确性      vs SIMD
+1       883us           44us            153.91ms       1/1         0.0x
+4       3.48ms          180us           9.94ms         4/4         0.0x
+16      13.74ms         663us           9.98ms         16/16       0.1x
+64      55.40ms         2.67ms          10.13ms        64/64       0.3x
+256     219.45ms        10.55ms         10.22ms        256/256     1.0x
+512     438.78ms        21.43ms         10.90ms        512/512     2.0x
+1024    877.74ms        42.96ms         11.03ms        1024/1024   3.9x
+2048    1.76s           84.62ms         11.39ms        2048/2048   7.4x
+4096    3.52s           172.17ms        15.63ms        4096/4096   11.0x
+8192    7.06s           339.79ms        21.48ms        8192/8192   15.8x
+```
+
+H800 CUDA 在 batch ≥256 时超过 CPU SIMD，batch 8192 达到约 15.8×。batch 1 的 153ms 主要是 CUDA context 初始化，不代表 kernel 边际成本。
+
+### 形状 sweep 和限制
+
+`bench_matrix_size_sweep` 非 extension 路径全部匹配；`al=200` 超过当前 GPU `MAX_AL=128`，按设计返回 sentinel，因此不计入正确性。
+
+```
+Matrix      CPU scalar   CUDA(H800)   正确性
+1k×10       4.48ms       156.19ms     64/64   (首次 CUDA 初始化)
+3k×50       54.81ms      10.05ms      64/64
+10k×50      181.75ms     32.65ms      64/64
+30k×50      544.96ms     97.94ms      64/64
+3k×200      214.29ms     398us        0/64    (MAX_AL=128 sentinel)
+```
+
+`bench_extension_mode` 在 Metal、wgpu 和 CUDA 上都是 `29/64` 匹配，说明这是现有 GPU 简化 DP 路径的共同限制，不是 CUDA 翻译新增错误。当前可认为正确并超过 SIMD 的结论仅覆盖 `ext=false` 的 splice-free benchmark。
+
+---
+
 ## 最终架构
 
 ```
 src/dp.metal       — Metal int16 标量 DP shader (MAX_AL=128, pointer rotation, aa/score-row cache)
 src/dp.wgsl        — wgpu WGSL 标量 DP shader (192 行, MAX_AL=128)
+src/cuda_dp.cu     — CUDA C++ 标量 DP kernel (MAX_AL=128, CUDA_THREADS=32 default)
 src/metal_dp.rs    — Metal host dispatch (no-copy input buffers, TG=32)
 src/wgpu_dp.rs     — wgpu host dispatch (387 行)
-src/gpu_bench.rs   — 综合 benchmark (CPU scalar + NEON + Metal + wgpu, batch 1-8192)
+src/cuda_dp.rs     — CUDA FFI wrapper (opt-in --features cuda)
+build.rs           — CUDA feature 下调用 nvcc, 默认 sm_90
+src/gpu_bench.rs   — 综合 benchmark (CPU scalar + SIMD + Metal + wgpu + CUDA, batch 1-8192)
 ```
 
 已删除：`dp_simd.metal`, `dp_tmem.metal`（实验性，不正确或无效）
@@ -362,5 +431,8 @@ src/gpu_bench.rs   — 综合 benchmark (CPU scalar + NEON + Metal + wgpu, batch
 | 9 | 指针轮转 + 去死写 | ✓ | **45ms** | **68ms** | **132ms** | 接近 NEON |
 | 10 | no-copy 输入 | ✓ | **47ms** | **66ms** | **127ms** | host 开销下降 |
 | 11 | aa/score-row cache + TG32 | ✓ | **43ms** | **46ms** | **87ms** | **超过 NEON** |
+| 12 | CUDA/H800 + 32 threads/block | ✓ ext=false | **10ms** | **11ms** | **16ms** | H800 上大幅超过 CPU SIMD |
 
 当前最佳 Metal 在该 benchmark 上超过 CPU NEON SIMD：batch 4096 为 86.81ms vs NEON 110.46ms，batch 8192 为 199.39ms vs NEON 224.47ms。
+
+当前最佳 CUDA/H800 在同类非 extension benchmark 上超过 CPU SIMD：batch 4096 为 15.63ms vs CPU SIMD 172.17ms，batch 8192 为 21.48ms vs CPU SIMD 339.79ms。

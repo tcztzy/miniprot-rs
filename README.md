@@ -88,22 +88,25 @@ compiled with arch-native flags (`-C target-cpu=native` / `-march=native
 - **Thread-local buffer reuse** — profile matrix and SIMD scratch arrays
   reused across DP calls via thread-local storage, cutting ~1 GB of temporary
   allocations per benchmark run.
-- **GPU-accelerated DP** — Metal compute shader with int16 arrays, pointer
-  rotation, score row cache, and optimised threadgroup sizing. Surpasses
-  NEON SIMD at batch ≥4096. Cross-platform via wgpu (Vulkan/Metal/DX12).
+- **GPU-accelerated DP** — Metal and CUDA compute kernels with int16 arrays,
+  pointer rotation, score row cache, and optimised launch sizing. Metal
+  surpasses NEON SIMD at batch ≥4096 on Apple M2; CUDA on H800 surpasses
+  CPU SIMD at batch ≥256. Cross-platform via wgpu (Vulkan/Metal/DX12).
   See [GPU optimization log](docs/gpu-optimization-log.md) for full
   experiment history.
 
-### GPU-Accelerated DP (Metal / Vulkan / DX12)
+### GPU-Accelerated DP (Metal / Vulkan / DX12 / CUDA)
 
 GPU backends for batched DP computation. At batch ≥4096, **Metal GPU surpasses
-NEON SIMD** — the first time GPU DP beats the CPU SIMD kernel on miniprot workloads.
+NEON SIMD** on Apple M2. On NVIDIA H800, the CUDA backend surpasses CPU SIMD
+from batch 256 and reaches ~15× at batch 8192.
 
 | Backend | API | Shader | Platform | Host LOC | Shader LOC |
 |---------|-----|--------|----------|----------|------------|
 | CPU NEON/SSE | Rust intrinsics | — | ARM / x86_64 | — | — |
-| **Metal** | metal-rs (raw) | MSL | macOS only | 260 | 117 |
+| **Metal** | metal-rs (raw) | MSL | macOS only | 276 | 128 |
 | **wgpu** | wgpu (cross) | WGSL | macOS/Linux/Windows | 387 | 192 |
+| **CUDA** | FFI + nvcc | CUDA C++ | NVIDIA GPUs | 145 | 278 |
 
 #### Batch Size Sweep (nl=3000, al=50, Apple M2, all 100% correct)
 
@@ -121,6 +124,30 @@ Metal 169ms vs NEON 219ms — **GPU 1.3x faster.** Kernel-only per-call cost dow
 18us (vs NEON 27us). GPU beats NEON because marginal per-call compute (11-24us) is
 below NEON's 27us, and fixed dispatch overhead (~40ms) is amortized at large batch.
 
+#### CUDA H800 Batch Size Sweep (nl=3000, al=50, ext=false, all 100% correct)
+
+CUDA is opt-in and requires the CUDA toolkit at build time:
+
+```bash
+CUDA_HOME=/usr/local/cuda-12.8 cargo test --release --features cuda bench_batch_size_sweep -- --nocapture
+```
+
+Defaults are tuned for H800 (`CUDA_ARCH=sm_90`, `CUDA_THREADS=32`) and can be
+overridden via environment variables.
+
+| Batch | CPU Scalar | CPU SIMD | CUDA H800 | vs Scalar | vs SIMD |
+|-------|-----------:|---------:|----------:|----------:|--------:|
+| 64 | 855us/call | 41us/call | 156us/call | 5.5x | 0.3x |
+| 256 | 857us/call | 41us/call | 39us/call | 21.5x | 1.0x |
+| 512 | 857us/call | 58us/call | 21us/call | 39.3x | 2.7x |
+| 1024 | 856us/call | 41us/call | 10us/call | 81.2x | 3.9x |
+| 2048 | 858us/call | 42us/call | 5us/call | 154.1x | 7.6x |
+| **4096** | 858us/call | 42us/call | **3us/call** | 223.1x | **11.1x faster** |
+| **8192** | 857us/call | 41us/call | **2us/call** | 318.6x | **15.5x faster** |
+
+At batch 8192: CUDA 22.05ms total vs CPU SIMD 342.37ms. The first batch pays
+CUDA context initialization, so small-batch latency is not representative.
+
 #### GPU kernel optimizations
 
 - **int16 DP arrays** — half stack footprint (1.8KB/thread), reduces VRAM spill
@@ -130,6 +157,7 @@ below NEON's 27us, and fixed dispatch overhead (~40ms) is amortized at large bat
 - **Thread-local aa buffer** — copy `aas[]` to register array, avoid VRAM random read
 - **Conditional row_max** — skip max tracking in non-extension mode
 - **TG=32** — per-threadgroup stack 58KB, fits in M2 GPU register file
+- **CUDA block size 32** — fastest H800 setting for large per-thread local arrays
 - **No-copy input buffers** — `new_buffer_with_bytes_no_copy` wraps host slices directly
   on Apple Silicon unified memory
 - **Dead store elimination** — remove per-row zero-fill that gets overwritten
@@ -139,11 +167,15 @@ GPU benchmarks:
 ```bash
 cargo test --release --lib gpu_bench -- --nocapture
 cargo test --release --lib bench_batch_size_sweep -- --nocapture
+CUDA_HOME=/usr/local/cuda-12.8 cargo test --release --features cuda bench_batch_size_sweep -- --nocapture
 ```
 
 Performance baseline is the current Rust implementation. GPU regressions
 measured against current Metal shader, not against C oracle. CPU NEON SIMD
-is the single-query baseline; GPU DP is the high-batch baseline (≥4096).
+is the single-query baseline; GPU DP is the high-batch baseline. The current
+GPU benchmark correctness claim covers the splice-free non-extension DP path
+(`ext=false`); extension mode remains a known limitation shared by Metal, wgpu,
+and CUDA.
 
 CPU benchmarks (vs C oracle):
 

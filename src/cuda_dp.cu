@@ -1,0 +1,278 @@
+#include <cuda_runtime.h>
+#include <stdint.h>
+#include <stddef.h>
+
+struct DpParams {
+    uint32_t nas_offset, aas_offset, nl, al;
+    int32_t go, ge, io, fs, goe, end_bonus, flag;
+    uint32_t slen;
+};
+
+struct DpResult {
+    int32_t score, nt_len, aa_len;
+};
+
+static constexpr int NEG = -16384;
+static constexpr uint8_t AA_STOP = 20;
+static constexpr int MAX_AL = 128;
+#ifndef CUDA_THREADS
+#define CUDA_THREADS 32
+#endif
+
+__device__ __forceinline__ int imax2(int a, int b) {
+    return a > b ? a : b;
+}
+
+__global__ void dp_batch_kernel(
+    const uint8_t* __restrict__ nas_buf,
+    const uint8_t* __restrict__ aas_buf,
+    const DpParams* __restrict__ params,
+    DpResult* __restrict__ results,
+    const int8_t* __restrict__ mat,
+    size_t n
+) {
+    const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    const DpParams p = params[tid];
+    if (p.nl < 2 || p.al == 0) {
+        results[tid] = DpResult{0, 0, 0};
+        return;
+    }
+    if (p.al > MAX_AL) {
+        results[tid] = DpResult{-1, 0, 0};
+        return;
+    }
+
+    const uint8_t* __restrict__ nas = nas_buf + p.nas_offset;
+    const uint8_t* __restrict__ aas = aas_buf + p.aas_offset;
+    const int al = (int)p.al;
+    const int nl = (int)p.nl;
+    const bool is_ext = (p.flag & 6) != 0;
+
+    short ha[MAX_AL + 1], hb[MAX_AL + 1], hc[MAX_AL + 1], hd[MAX_AL + 1];
+    short da[MAX_AL + 1], db[MAX_AL + 1], dc[MAX_AL + 1], dd[MAX_AL + 1];
+    short h_best[MAX_AL + 1];
+    short *h3 = ha, *h2 = hb, *h1 = hc, *h0 = hd;
+    short *d3 = da, *d2 = db, *d1 = dc, *d0 = dd;
+    uint8_t aa_local[MAX_AL];
+    int8_t score_row[MAX_AL];
+    uint8_t score_nt = 255;
+
+    for (int j = 0; j <= al; ++j) {
+        h3[j] = NEG; h2[j] = NEG; h1[j] = NEG;
+        d3[j] = NEG; d2[j] = NEG; d1[j] = NEG;
+    }
+    for (int j = 0; j < al; ++j) aa_local[j] = aas[j];
+    h3[0] = 0;
+    h2[0] = (short)-p.fs;
+    h1[0] = (short)-p.fs;
+
+    int best_sc = NEG;
+    int best_sc_log = NEG;
+    int best_i = -1;
+    const int pen_len = al * 3;
+
+    for (int i = 2; i < nl; ++i) {
+        const uint8_t nt_aa = nas[i];
+        const int gei = nt_aa == AA_STOP ? p.fs : p.ge;
+        if (nt_aa != score_nt) {
+            for (int j = 0; j < al; ++j) {
+                score_row[j] = mat[(int)nt_aa * 22 + aa_local[j]];
+            }
+            score_nt = nt_aa;
+        }
+
+        const int od0 = (int)h3[0] - p.go;
+        const int ed0 = (int)d3[0];
+        const int dv0 = imax2(od0, ed0) - gei;
+        d0[0] = (short)dv0;
+        h0[0] = (short)imax2(dv0, imax2((int)h1[0] - p.fs, (int)h2[0] - p.fs));
+
+        int ist = NEG;
+        int row_max = NEG;
+
+        for (int j = 0; j < al; ++j) {
+            const int col = j + 1;
+            int best = (int)h3[j] + (int)score_row[j];
+
+            const int oi = (int)h0[j] - p.go;
+            const int ti = imax2(oi, ist) - p.ge;
+            ist = ti;
+            if (ti > best) best = ti;
+
+            const int od = (int)h3[col] - p.go;
+            const int td = imax2(od, (int)d3[col]) - gei;
+            d0[col] = (short)td;
+            if (td > best) best = td;
+
+            int t = (int)h1[j] - p.fs; if (t > best) best = t;
+            t = (int)h2[j] - p.fs; if (t > best) best = t;
+            t = (int)h1[col] - p.fs; if (t > best) best = t;
+            t = (int)h2[col] - p.fs; if (t > best) best = t;
+
+            h0[col] = (short)best;
+            if (is_ext) row_max = imax2(row_max, best);
+        }
+
+        if (is_ext) {
+            const int end_sc = (int)h0[al] + p.end_bonus;
+            int tmp_sc = imax2(row_max, end_sc);
+            int len_pen = 0;
+            const int row_off = i - pen_len;
+            if (row_off >= 2) {
+                const float xf = (float)row_off;
+                int bits = __float_as_int(xf);
+                float log_2 = (float)(((bits >> 23) & 255) - 128);
+                bits &= ~(255 << 23);
+                bits += 127 << 23;
+                const float z = __int_as_float(bits);
+                log_2 += (-0.34484843f * z + 2.02466578f) * z - 0.67487759f;
+                len_pen = (int)(0.5f * log_2 + 0.5f);
+            }
+            const int tmp_sc_log = tmp_sc - len_pen;
+            if (tmp_sc_log > best_sc_log) {
+                best_sc = tmp_sc;
+                best_sc_log = tmp_sc_log;
+                best_i = i;
+                for (int j = 0; j <= al; ++j) h_best[j] = h0[j];
+            }
+            if (best_sc_log - tmp_sc_log > 100) break;
+        }
+
+        short* ht = h3; h3 = h2; h2 = h1; h1 = h0; h0 = ht;
+        short* dt = d3; d3 = d2; d2 = d1; d1 = d0; d0 = dt;
+    }
+
+    if (is_ext) {
+        int best_aa = 0;
+        for (int j = 0; j < al; ++j) {
+            int sc = (int)h_best[j + 1];
+            if (j == al - 1) sc += p.end_bonus;
+            if (sc == best_sc) {
+                best_aa = j + 1;
+                break;
+            }
+        }
+        results[tid] = DpResult{best_sc, best_i + 1, best_aa};
+    } else {
+        results[tid] = DpResult{(int)h1[al], nl, al};
+    }
+}
+
+static int launch_dp(
+    const uint8_t* d_nas,
+    const uint8_t* d_aas,
+    const DpParams* d_params,
+    DpResult* d_results,
+    const int8_t* d_matrix,
+    size_t n
+) {
+    const int threads = CUDA_THREADS;
+    const int blocks = (int)((n + threads - 1) / threads);
+    dp_batch_kernel<<<blocks, threads>>>(d_nas, d_aas, d_params, d_results, d_matrix, n);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int miniprot_cuda_available() {
+    int count = 0;
+    cudaError_t err = cudaGetDeviceCount(&count);
+    return err == cudaSuccess && count > 0 ? 1 : 0;
+}
+
+extern "C" int miniprot_cuda_batch_dp(
+    const uint8_t* nas,
+    size_t nas_len,
+    const uint8_t* aas,
+    size_t aas_len,
+    const DpParams* params,
+    size_t n,
+    const int8_t* matrix,
+    DpResult* results
+) {
+    uint8_t *d_nas = nullptr, *d_aas = nullptr;
+    DpParams* d_params = nullptr;
+    DpResult* d_results = nullptr;
+    int8_t* d_matrix = nullptr;
+
+    cudaError_t err;
+    err = cudaMalloc((void**)&d_nas, nas_len); if (err != cudaSuccess) return (int)err;
+    err = cudaMalloc((void**)&d_aas, aas_len); if (err != cudaSuccess) return (int)err;
+    err = cudaMalloc((void**)&d_params, n * sizeof(DpParams)); if (err != cudaSuccess) return (int)err;
+    err = cudaMalloc((void**)&d_results, n * sizeof(DpResult)); if (err != cudaSuccess) return (int)err;
+    err = cudaMalloc((void**)&d_matrix, 22 * 22); if (err != cudaSuccess) return (int)err;
+
+    err = cudaMemcpy(d_nas, nas, nas_len, cudaMemcpyHostToDevice); if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpy(d_aas, aas, aas_len, cudaMemcpyHostToDevice); if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpy(d_params, params, n * sizeof(DpParams), cudaMemcpyHostToDevice); if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpy(d_matrix, matrix, 22 * 22, cudaMemcpyHostToDevice); if (err != cudaSuccess) return (int)err;
+
+    int code = launch_dp(d_nas, d_aas, d_params, d_results, d_matrix, n);
+    if (code == cudaSuccess) code = (int)cudaDeviceSynchronize();
+    if (code == cudaSuccess) {
+        code = (int)cudaMemcpy(results, d_results, n * sizeof(DpResult), cudaMemcpyDeviceToHost);
+    }
+
+    cudaFree(d_matrix);
+    cudaFree(d_results);
+    cudaFree(d_params);
+    cudaFree(d_aas);
+    cudaFree(d_nas);
+    return code;
+}
+
+extern "C" int miniprot_cuda_bench_dispatch_only(
+    const uint8_t* nas,
+    size_t nas_len,
+    const uint8_t* aas,
+    size_t aas_len,
+    const DpParams* params,
+    size_t n,
+    const int8_t* matrix,
+    float* warmup_ms,
+    float* timed_ms
+) {
+    uint8_t *d_nas = nullptr, *d_aas = nullptr;
+    DpParams* d_params = nullptr;
+    DpResult* d_results = nullptr;
+    int8_t* d_matrix = nullptr;
+    cudaEvent_t start = nullptr, stop = nullptr;
+
+    cudaError_t err;
+    err = cudaMalloc((void**)&d_nas, nas_len); if (err != cudaSuccess) return (int)err;
+    err = cudaMalloc((void**)&d_aas, aas_len); if (err != cudaSuccess) return (int)err;
+    err = cudaMalloc((void**)&d_params, n * sizeof(DpParams)); if (err != cudaSuccess) return (int)err;
+    err = cudaMalloc((void**)&d_results, n * sizeof(DpResult)); if (err != cudaSuccess) return (int)err;
+    err = cudaMalloc((void**)&d_matrix, 22 * 22); if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpy(d_nas, nas, nas_len, cudaMemcpyHostToDevice); if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpy(d_aas, aas, aas_len, cudaMemcpyHostToDevice); if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpy(d_params, params, n * sizeof(DpParams), cudaMemcpyHostToDevice); if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpy(d_matrix, matrix, 22 * 22, cudaMemcpyHostToDevice); if (err != cudaSuccess) return (int)err;
+
+    err = cudaEventCreate(&start); if (err != cudaSuccess) return (int)err;
+    err = cudaEventCreate(&stop); if (err != cudaSuccess) return (int)err;
+
+    launch_dp(d_nas, d_aas, d_params, d_results, d_matrix, n);
+    err = cudaDeviceSynchronize(); if (err != cudaSuccess) return (int)err;
+
+    cudaEventRecord(start);
+    launch_dp(d_nas, d_aas, d_params, d_results, d_matrix, n);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(warmup_ms, start, stop);
+
+    cudaEventRecord(start);
+    launch_dp(d_nas, d_aas, d_params, d_results, d_matrix, n);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(timed_ms, start, stop);
+
+    cudaEventDestroy(stop);
+    cudaEventDestroy(start);
+    cudaFree(d_matrix);
+    cudaFree(d_results);
+    cudaFree(d_params);
+    cudaFree(d_aas);
+    cudaFree(d_nas);
+    return (int)cudaGetLastError();
+}
