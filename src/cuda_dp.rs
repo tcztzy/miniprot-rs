@@ -10,7 +10,9 @@ use crate::metal_dp::{DpParams, DpResult};
 #[allow(dead_code)]
 mod imp {
     use super::{DpParams, DpResult};
-    use std::time::Duration;
+    use std::{sync::Mutex, time::Duration};
+
+    static CUDA_LOCK: Mutex<()> = Mutex::new(());
 
     unsafe extern "C" {
         fn miniprot_cuda_available() -> i32;
@@ -56,6 +58,7 @@ mod imp {
         }
         let flat_matrix = matrix.as_flattened();
         let mut results = vec![DpResult::default(); params.len()];
+        let _guard = CUDA_LOCK.lock().ok()?;
         let code = unsafe {
             miniprot_cuda_batch_dp(
                 nas_buf.as_ptr(),
@@ -83,6 +86,7 @@ mod imp {
         let flat_matrix = matrix.as_flattened();
         let mut warmup_ms = 0.0f32;
         let mut timed_ms = 0.0f32;
+        let _guard = CUDA_LOCK.lock().ok()?;
         let code = unsafe {
             miniprot_cuda_bench_dispatch_only(
                 nas_buf.as_ptr(),

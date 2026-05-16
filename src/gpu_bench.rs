@@ -558,6 +558,53 @@ fn bench_kernel_only() {
     }
 }
 
+#[test]
+fn bench_cuda_repeated_batch() {
+    if !crate::cuda_dp::available() {
+        eprintln!("CUDA repeated batch: not available");
+        return;
+    }
+
+    eprintln!("\n=== CUDA Repeated Batch (batch=8192, nl=3000, al=50) ===");
+    let mut seed: u64 = 22222;
+    let mut rng = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        seed
+    };
+    let data = generate_workload(8192, 3000, 50, false, &mut rng);
+    let (scalar_results, scalar_time) = run_cpu_scalar(&data, false);
+    eprintln!(
+        "  CPU scalar: {} total, {}/call",
+        format_dur(scalar_time),
+        format_dur(scalar_time / 8192)
+    );
+
+    let mut times = Vec::new();
+    for iter in 0..6 {
+        let start = Instant::now();
+        let results = crate::cuda_dp::batch_dp(&data.nas_buf, &data.aas_buf, &data.params)
+            .expect("CUDA batch");
+        let total = start.elapsed();
+        let (ok, _, _) = check_correctness(&scalar_results, &results, 2);
+        eprintln!(
+            "  iter {iter}: {} total, {}/call [match:{ok}/8192]",
+            format_dur(total),
+            format_dur(total / 8192)
+        );
+        times.push(total);
+    }
+    let steady = &times[1..];
+    let best = steady.iter().copied().min().unwrap();
+    let avg = steady.iter().sum::<std::time::Duration>() / steady.len() as u32;
+    eprintln!(
+        "  steady best: {}, avg: {}",
+        format_dur(best),
+        format_dur(avg)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Code complexity / maintainability metrics
 // ---------------------------------------------------------------------------

@@ -399,12 +399,66 @@ Matrix      CPU scalar   CUDA(H800)   正确性
 
 ---
 
+## 实验 13：CUDA no-ext 专用 kernel 和 reusable device buffers
+
+### 假设
+
+CUDASW++4.0 的一个核心经验是按 workload 形状做专用 kernel，而不是让一个通用 kernel 覆盖所有路径。当前 H800 benchmark 全部是 `ext=false`，但实验 12 的 CUDA kernel 仍然保留 extension-mode 的 `h_best`、`row_max` 和内层 `if (is_ext)` 分支。
+
+实现：
+
+- `ext=false` batch 自动走 `dp_batch_kernel_noext`
+- 保留通用 kernel 作为 extension 或 mixed flags 的 fallback
+- `miniprot_cuda_batch_dp` 保留 device buffers，后续 batch 只在容量不足时重新分配
+- 重新 sweep `CUDA_THREADS`，默认仍为 32
+
+### Block size sweep
+
+```
+Threads/block   Batch 256   Batch 1024   Batch 4096   Batch 8192
+16              9.19ms      9.19ms       10.49ms      17.66ms
+32              9.28ms      9.28ms       9.65ms       10.41ms
+64              9.30ms      9.52ms       9.65ms       11.86ms
+96              9.68ms      10.26ms      10.54ms      11.02ms
+128             11.34ms     11.43ms      14.20ms      14.15ms
+```
+
+结论：`CUDA_THREADS=32` 仍是大 batch 最优。16 threads/block 对小 batch 略快，但 8192 batch 明显退化。
+
+### 新 baseline
+
+`bench_batch_size_sweep` (`nl=3000, al=50, ext=false`)：
+
+```
+Batch   CPU scalar       CPU SIMD        CUDA(H800)     正确性      vs SIMD
+64      55.92ms         2.65ms          9.40ms         64/64       0.3x
+256     225.60ms        10.54ms         9.55ms         256/256     1.1x
+512     438.71ms        21.25ms         10.39ms        512/512     2.0x
+1024    880.06ms        42.13ms         10.13ms        1024/1024   4.2x
+2048    1.79s           84.39ms         10.81ms        2048/2048   7.8x
+4096    3.53s           172.56ms        14.98ms        4096/4096   11.5x
+8192    7.02s           341.96ms        21.74ms        8192/8192   15.7x
+```
+
+重复同一 8192 batch 的稳态结果更能体现 reusable buffers：
+
+```
+Baseline experiment 12: best 13.19ms, avg 13.71ms
+Experiment 13:          best 12.54ms, avg 13.16ms
+```
+
+收益不大，但在 kernel-only、one-shot batch sweep、repeated batch 三个口径都为正。新的 H800 CUDA baseline 采用 no-ext 专用 kernel + reusable device buffers。
+
+extension-mode fallback 未改变：`bench_extension_mode` 仍为 `29/64` 匹配，与 Metal/wgpu 的既有限制一致。
+
+---
+
 ## 最终架构
 
 ```
 src/dp.metal       — Metal int16 标量 DP shader (MAX_AL=128, pointer rotation, aa/score-row cache)
 src/dp.wgsl        — wgpu WGSL 标量 DP shader (192 行, MAX_AL=128)
-src/cuda_dp.cu     — CUDA C++ 标量 DP kernel (MAX_AL=128, CUDA_THREADS=32 default)
+src/cuda_dp.cu     — CUDA C++ 标量 DP kernels (generic + no-ext, MAX_AL=128, CUDA_THREADS=32 default)
 src/metal_dp.rs    — Metal host dispatch (no-copy input buffers, TG=32)
 src/wgpu_dp.rs     — wgpu host dispatch (387 行)
 src/cuda_dp.rs     — CUDA FFI wrapper (opt-in --features cuda)
@@ -432,7 +486,8 @@ src/gpu_bench.rs   — 综合 benchmark (CPU scalar + SIMD + Metal + wgpu + CUDA
 | 10 | no-copy 输入 | ✓ | **47ms** | **66ms** | **127ms** | host 开销下降 |
 | 11 | aa/score-row cache + TG32 | ✓ | **43ms** | **46ms** | **87ms** | **超过 NEON** |
 | 12 | CUDA/H800 + 32 threads/block | ✓ ext=false | **10ms** | **11ms** | **16ms** | H800 上大幅超过 CPU SIMD |
+| 13 | CUDA no-ext kernel + reusable buffers | ✓ ext=false | **10ms** | **10ms** | **15ms** | 小幅提升, 新 H800 baseline |
 
 当前最佳 Metal 在该 benchmark 上超过 CPU NEON SIMD：batch 4096 为 86.81ms vs NEON 110.46ms，batch 8192 为 199.39ms vs NEON 224.47ms。
 
-当前最佳 CUDA/H800 在同类非 extension benchmark 上超过 CPU SIMD：batch 4096 为 15.63ms vs CPU SIMD 172.17ms，batch 8192 为 21.48ms vs CPU SIMD 339.79ms。
+当前最佳 CUDA/H800 在同类非 extension benchmark 上超过 CPU SIMD：batch 4096 为 14.98ms vs CPU SIMD 172.56ms，batch 8192 为 21.74ms vs CPU SIMD 341.96ms。重复 8192 batch 的稳态 best/avg 为 12.54ms/13.16ms。

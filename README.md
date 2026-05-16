@@ -137,16 +137,19 @@ overridden via environment variables.
 
 | Batch | CPU Scalar | CPU SIMD | CUDA H800 | vs Scalar | vs SIMD |
 |-------|-----------:|---------:|----------:|----------:|--------:|
-| 64 | 855us/call | 41us/call | 156us/call | 5.5x | 0.3x |
-| 256 | 857us/call | 41us/call | 39us/call | 21.5x | 1.0x |
-| 512 | 857us/call | 58us/call | 21us/call | 39.3x | 2.7x |
-| 1024 | 856us/call | 41us/call | 10us/call | 81.2x | 3.9x |
-| 2048 | 858us/call | 42us/call | 5us/call | 154.1x | 7.6x |
-| **4096** | 858us/call | 42us/call | **3us/call** | 223.1x | **11.1x faster** |
-| **8192** | 857us/call | 41us/call | **2us/call** | 318.6x | **15.5x faster** |
+| 64 | 873us/call | 41us/call | 146us/call | 5.9x | 0.3x |
+| 256 | 881us/call | 41us/call | 37us/call | 23.6x | 1.1x |
+| 512 | 856us/call | 41us/call | 20us/call | 42.2x | 2.0x |
+| 1024 | 859us/call | 41us/call | 9us/call | 86.9x | 4.2x |
+| 2048 | 874us/call | 41us/call | 5us/call | 165.7x | 7.8x |
+| **4096** | 861us/call | 42us/call | **3us/call** | 235.4x | **11.5x faster** |
+| **8192** | 857us/call | 41us/call | **2us/call** | 323.1x | **15.7x faster** |
 
-At batch 8192: CUDA 22.05ms total vs CPU SIMD 342.37ms. The first batch pays
-CUDA context initialization, so small-batch latency is not representative.
+At batch 8192: CUDA 21.74ms total vs CPU SIMD 341.96ms. The first batch pays
+CUDA context initialization, so small-batch latency is not representative. For
+repeated 8192-call batches, reusable CUDA buffers and the specialized
+non-extension kernel reduce steady-state time from 13.71ms to 13.16ms average
+(best observed: 12.54ms).
 
 #### GPU kernel optimizations
 
@@ -158,6 +161,10 @@ CUDA context initialization, so small-batch latency is not representative.
 - **Conditional row_max** — skip max tracking in non-extension mode
 - **TG=32** — per-threadgroup stack 58KB, fits in M2 GPU register file
 - **CUDA block size 32** — fastest H800 setting for large per-thread local arrays
+- **CUDA non-extension kernel** — launches a specialized kernel for `ext=false`,
+  removing `h_best`, `row_max`, and extension branches from the hot path
+- **Reusable CUDA buffers** — keeps device buffers between batches and grows them
+  only when needed, reducing repeated-batch allocation overhead
 - **No-copy input buffers** — `new_buffer_with_bytes_no_copy` wraps host slices directly
   on Apple Silicon unified memory
 - **Dead store elimination** — remove per-row zero-fill that gets overwritten
@@ -168,6 +175,7 @@ GPU benchmarks:
 cargo test --release --lib gpu_bench -- --nocapture
 cargo test --release --lib bench_batch_size_sweep -- --nocapture
 CUDA_HOME=/usr/local/cuda-12.8 cargo test --release --features cuda bench_batch_size_sweep -- --nocapture
+CUDA_HOME=/usr/local/cuda-12.8 cargo test --release --features cuda bench_cuda_repeated_batch -- --nocapture
 ```
 
 Performance baseline is the current Rust implementation. GPU regressions
