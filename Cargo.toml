@@ -2,6 +2,11 @@
 name = "miniprot"
 version = "0.1.0"
 edition = "2024"
+description = "Rust port of miniprot with SIMD and batched GPU DP backends"
+license = "MIT"
+repository = "https://github.com/tcztzy/miniprot-rs"
+readme = "README.md"
+exclude = ["miniprot/**"]
 
 [features]
 cuda = []
