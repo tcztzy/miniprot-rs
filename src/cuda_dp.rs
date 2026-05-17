@@ -10,7 +10,7 @@ use crate::metal_dp::{DpParams, DpResult};
 #[allow(dead_code)]
 mod imp {
     use super::{DpParams, DpResult};
-    use std::{sync::Mutex, time::Duration};
+    use std::{ffi::c_void, ptr::NonNull, sync::Mutex, time::Duration};
 
     static CUDA_LOCK: Mutex<()> = Mutex::new(());
 
@@ -37,6 +37,18 @@ mod imp {
             warmup_ms: *mut f32,
             timed_ms: *mut f32,
         ) -> i32;
+        fn miniprot_cuda_prepared_batch_create(
+            nas: *const u8,
+            nas_len: usize,
+            aas: *const u8,
+            aas_len: usize,
+            params: *const DpParams,
+            n: usize,
+            matrix: *const i8,
+            out: *mut *mut c_void,
+        ) -> i32;
+        fn miniprot_cuda_prepared_batch_run(batch: *mut c_void, results: *mut DpResult) -> i32;
+        fn miniprot_cuda_prepared_batch_destroy(batch: *mut c_void);
     }
 
     pub fn available() -> bool {
@@ -107,6 +119,62 @@ mod imp {
             )
         })
     }
+
+    pub struct PreparedBatch {
+        raw: NonNull<c_void>,
+        len: usize,
+    }
+
+    impl PreparedBatch {
+        pub fn new(
+            nas_buf: &[u8],
+            aas_buf: &[u8],
+            params: &[DpParams],
+            matrix: &[[i8; 22]; 22],
+        ) -> Option<Self> {
+            if params.is_empty() {
+                return None;
+            }
+            let flat_matrix = matrix.as_flattened();
+            let mut raw = std::ptr::null_mut();
+            let _guard = CUDA_LOCK.lock().ok()?;
+            let code = unsafe {
+                miniprot_cuda_prepared_batch_create(
+                    nas_buf.as_ptr(),
+                    nas_buf.len(),
+                    aas_buf.as_ptr(),
+                    aas_buf.len(),
+                    params.as_ptr(),
+                    params.len(),
+                    flat_matrix.as_ptr(),
+                    &mut raw,
+                )
+            };
+            if code != 0 {
+                return None;
+            }
+            Some(Self {
+                raw: NonNull::new(raw)?,
+                len: params.len(),
+            })
+        }
+
+        pub fn run(&self) -> Option<Vec<DpResult>> {
+            let mut results = vec![DpResult::default(); self.len];
+            let _guard = CUDA_LOCK.lock().ok()?;
+            let code = unsafe {
+                miniprot_cuda_prepared_batch_run(self.raw.as_ptr(), results.as_mut_ptr())
+            };
+            (code == 0).then_some(results)
+        }
+    }
+
+    impl Drop for PreparedBatch {
+        fn drop(&mut self) {
+            let _guard = CUDA_LOCK.lock().ok();
+            unsafe { miniprot_cuda_prepared_batch_destroy(self.raw.as_ptr()) };
+        }
+    }
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -142,6 +210,23 @@ mod imp {
         _matrix: &[[i8; 22]; 22],
     ) -> Option<(std::time::Duration, std::time::Duration)> {
         None
+    }
+
+    pub struct PreparedBatch;
+
+    impl PreparedBatch {
+        pub fn new(
+            _nas_buf: &[u8],
+            _aas_buf: &[u8],
+            _params: &[DpParams],
+            _matrix: &[[i8; 22]; 22],
+        ) -> Option<Self> {
+            None
+        }
+
+        pub fn run(&self) -> Option<Vec<DpResult>> {
+            None
+        }
     }
 }
 

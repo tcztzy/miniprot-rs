@@ -453,15 +453,47 @@ extension-mode fallback 未改变：`bench_extension_mode` 仍为 `29/64` 匹配
 
 ---
 
+## 实验 14：CUDA prepared batch，输入常驻 H800
+
+### 假设
+
+CUDASW++ 的数据库常驻策略可以简化借鉴到当前 DP batch：如果同一批 `nas/aas/params/matrix` 会重复运行，就不应每次都重新做 H2D input copy。实验 13 的 reusable buffers 只复用分配，仍然每次复制输入；prepared batch 进一步把输入、参数和评分矩阵上传一次，后续运行只做 kernel launch、同步和 `results` D2H copy。
+
+### 实现
+
+- 新增 CUDA FFI：
+  - `miniprot_cuda_prepared_batch_create`
+  - `miniprot_cuda_prepared_batch_run`
+  - `miniprot_cuda_prepared_batch_destroy`
+- Rust 侧新增 `cuda_dp::PreparedBatch`，用 `Drop` 释放 device buffers
+- `bench_cuda_repeated_batch` 同时输出普通 batch path 和 prepared batch path，使用同一个 8192-call workload 直接对照
+
+### 结果
+
+`bench_cuda_repeated_batch` (`batch=8192, nl=3000, al=50, ext=false`)：
+
+```
+Experiment 13 baseline:    best 12.54ms, avg 13.16ms
+Experiment 14 prepared:    best 10.50ms, avg 11.41ms
+Prepared upload cost:      2.31ms
+Correctness:               8192/8192
+```
+
+prepared path 比最新 baseline 的 best 快约 16%，avg 快约 13%。这基本贴近之前 kernel-only 约 10.4ms 的下界，说明当前重复 workload 的剩余主成本已经是 DP kernel 本身，而不是 host input copy。
+
+远端 H800 当时有其他 Python GPU 进程，one-shot batch sweep 和 kernel-only 口径抖动较大；采用标准仍按同一 repeated workload 的普通路径与 prepared 路径对照。新的 H800 repeated-batch baseline 采用 prepared batch。
+
+---
+
 ## 最终架构
 
 ```
 src/dp.metal       — Metal int16 标量 DP shader (MAX_AL=128, pointer rotation, aa/score-row cache)
 src/dp.wgsl        — wgpu WGSL 标量 DP shader (192 行, MAX_AL=128)
-src/cuda_dp.cu     — CUDA C++ 标量 DP kernels (generic + no-ext, MAX_AL=128, CUDA_THREADS=32 default)
+src/cuda_dp.cu     — CUDA C++ 标量 DP kernels (generic + no-ext, prepared batch, MAX_AL=128, CUDA_THREADS=32 default)
 src/metal_dp.rs    — Metal host dispatch (no-copy input buffers, TG=32)
 src/wgpu_dp.rs     — wgpu host dispatch (387 行)
-src/cuda_dp.rs     — CUDA FFI wrapper (opt-in --features cuda)
+src/cuda_dp.rs     — CUDA FFI wrapper + PreparedBatch (opt-in --features cuda)
 build.rs           — CUDA feature 下调用 nvcc, 默认 sm_90
 src/gpu_bench.rs   — 综合 benchmark (CPU scalar + SIMD + Metal + wgpu + CUDA, batch 1-8192)
 ```
@@ -487,7 +519,8 @@ src/gpu_bench.rs   — 综合 benchmark (CPU scalar + SIMD + Metal + wgpu + CUDA
 | 11 | aa/score-row cache + TG32 | ✓ | **43ms** | **46ms** | **87ms** | **超过 NEON** |
 | 12 | CUDA/H800 + 32 threads/block | ✓ ext=false | **10ms** | **11ms** | **16ms** | H800 上大幅超过 CPU SIMD |
 | 13 | CUDA no-ext kernel + reusable buffers | ✓ ext=false | **10ms** | **10ms** | **15ms** | 小幅提升, 新 H800 baseline |
+| 14 | CUDA prepared batch | ✓ ext=false | — | — | — | 重复 8192 batch avg **11.41ms**, 新 H800 repeated baseline |
 
 当前最佳 Metal 在该 benchmark 上超过 CPU NEON SIMD：batch 4096 为 86.81ms vs NEON 110.46ms，batch 8192 为 199.39ms vs NEON 224.47ms。
 
-当前最佳 CUDA/H800 在同类非 extension benchmark 上超过 CPU SIMD：batch 4096 为 14.98ms vs CPU SIMD 172.56ms，batch 8192 为 21.74ms vs CPU SIMD 341.96ms。重复 8192 batch 的稳态 best/avg 为 12.54ms/13.16ms。
+当前最佳 CUDA/H800 在同类非 extension benchmark 上超过 CPU SIMD：batch 4096 为 14.98ms vs CPU SIMD 172.56ms，batch 8192 为 21.74ms vs CPU SIMD 341.96ms。prepared 重复 8192 batch 的稳态 best/avg 为 10.50ms/11.41ms。

@@ -581,6 +581,7 @@ fn bench_cuda_repeated_batch() {
         format_dur(scalar_time / 8192)
     );
 
+    eprintln!("  normal batch path:");
     let mut times = Vec::new();
     for iter in 0..6 {
         let start = Instant::now();
@@ -589,7 +590,7 @@ fn bench_cuda_repeated_batch() {
         let total = start.elapsed();
         let (ok, _, _) = check_correctness(&scalar_results, &results, 2);
         eprintln!(
-            "  iter {iter}: {} total, {}/call [match:{ok}/8192]",
+            "    iter {iter}: {} total, {}/call [match:{ok}/8192]",
             format_dur(total),
             format_dur(total / 8192)
         );
@@ -599,7 +600,40 @@ fn bench_cuda_repeated_batch() {
     let best = steady.iter().copied().min().unwrap();
     let avg = steady.iter().sum::<std::time::Duration>() / steady.len() as u32;
     eprintln!(
-        "  steady best: {}, avg: {}",
+        "    steady best: {}, avg: {}",
+        format_dur(best),
+        format_dur(avg)
+    );
+
+    let start = Instant::now();
+    let prepared = crate::cuda_dp::PreparedBatch::new(
+        &data.nas_buf,
+        &data.aas_buf,
+        &data.params,
+        &crate::tables::BLOSUM62,
+    )
+    .expect("CUDA prepared batch");
+    eprintln!("  prepared upload: {}", format_dur(start.elapsed()));
+
+    eprintln!("  prepared batch path:");
+    let mut times = Vec::new();
+    for iter in 0..6 {
+        let start = Instant::now();
+        let results = prepared.run().expect("CUDA prepared run");
+        let total = start.elapsed();
+        let (ok, _, _) = check_correctness(&scalar_results, &results, 2);
+        eprintln!(
+            "    iter {iter}: {} total, {}/call [match:{ok}/8192]",
+            format_dur(total),
+            format_dur(total / 8192)
+        );
+        times.push(total);
+    }
+    let steady = &times[1..];
+    let best = steady.iter().copied().min().unwrap();
+    let avg = steady.iter().sum::<std::time::Duration>() / steady.len() as u32;
+    eprintln!(
+        "    steady best: {}, avg: {}",
         format_dur(best),
         format_dur(avg)
     );

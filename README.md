@@ -89,9 +89,10 @@ compiled with arch-native flags (`-C target-cpu=native` / `-march=native
   reused across DP calls via thread-local storage, cutting ~1 GB of temporary
   allocations per benchmark run.
 - **GPU-accelerated DP** — Metal and CUDA compute kernels with int16 arrays,
-  pointer rotation, score row cache, and optimised launch sizing. Metal
-  surpasses NEON SIMD at batch ≥4096 on Apple M2; CUDA on H800 surpasses
-  CPU SIMD at batch ≥256. Cross-platform via wgpu (Vulkan/Metal/DX12).
+  pointer rotation, score row cache, optimised launch sizing, and prepared
+  CUDA batches. Metal surpasses NEON SIMD at batch ≥4096 on Apple M2; CUDA on
+  H800 surpasses CPU SIMD at batch ≥256. Cross-platform via wgpu
+  (Vulkan/Metal/DX12).
   See [GPU optimization log](docs/gpu-optimization-log.md) for full
   experiment history.
 
@@ -147,9 +148,9 @@ overridden via environment variables.
 
 At batch 8192: CUDA 21.74ms total vs CPU SIMD 341.96ms. The first batch pays
 CUDA context initialization, so small-batch latency is not representative. For
-repeated 8192-call batches, reusable CUDA buffers and the specialized
-non-extension kernel reduce steady-state time from 13.71ms to 13.16ms average
-(best observed: 12.54ms).
+repeated 8192-call batches, the CUDASW++-style prepared-batch path uploads
+`nas/aas/params/matrix` once and then reruns the resident workload at 11.41ms
+steady-state average (best observed: 10.50ms).
 
 #### GPU kernel optimizations
 
@@ -165,6 +166,9 @@ non-extension kernel reduce steady-state time from 13.71ms to 13.16ms average
   removing `h_best`, `row_max`, and extension branches from the hot path
 - **Reusable CUDA buffers** — keeps device buffers between batches and grows them
   only when needed, reducing repeated-batch allocation overhead
+- **Prepared CUDA batches** — keeps a repeated batch's input and scoring matrix
+  resident on the H800, reducing steady-state 8192-call batches from 13.16ms to
+  11.41ms average
 - **No-copy input buffers** — `new_buffer_with_bytes_no_copy` wraps host slices directly
   on Apple Silicon unified memory
 - **Dead store elimination** — remove per-row zero-fill that gets overwritten

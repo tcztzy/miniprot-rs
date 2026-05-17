@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 struct DpParams {
     uint32_t nas_offset, aas_offset, nl, al;
@@ -301,6 +302,26 @@ static cudaError_t reserve_device(void** ptr, size_t* cap, size_t bytes) {
     return cudaSuccess;
 }
 
+struct PreparedBatch {
+    uint8_t* nas = nullptr;
+    uint8_t* aas = nullptr;
+    DpParams* params = nullptr;
+    DpResult* results = nullptr;
+    int8_t* matrix = nullptr;
+    size_t n = 0;
+    bool noext = false;
+};
+
+static void destroy_prepared(PreparedBatch* batch) {
+    if (!batch) return;
+    cudaFree(batch->matrix);
+    cudaFree(batch->results);
+    cudaFree(batch->params);
+    cudaFree(batch->aas);
+    cudaFree(batch->nas);
+    free(batch);
+}
+
 extern "C" int miniprot_cuda_available() {
     int count = 0;
     cudaError_t err = cudaGetDeviceCount(&count);
@@ -336,6 +357,60 @@ extern "C" int miniprot_cuda_batch_dp(
     }
 
     return code;
+}
+
+extern "C" int miniprot_cuda_prepared_batch_create(
+    const uint8_t* nas,
+    size_t nas_len,
+    const uint8_t* aas,
+    size_t aas_len,
+    const DpParams* params,
+    size_t n,
+    const int8_t* matrix,
+    PreparedBatch** out
+) {
+    *out = nullptr;
+    PreparedBatch* batch = (PreparedBatch*)malloc(sizeof(PreparedBatch));
+    if (!batch) return (int)cudaErrorMemoryAllocation;
+    batch->nas = nullptr;
+    batch->aas = nullptr;
+    batch->params = nullptr;
+    batch->results = nullptr;
+    batch->matrix = nullptr;
+    batch->n = n;
+    batch->noext = all_noext(params, n);
+
+    cudaError_t err;
+    err = cudaMalloc((void**)&batch->nas, nas_len); if (err != cudaSuccess) { destroy_prepared(batch); return (int)err; }
+    err = cudaMalloc((void**)&batch->aas, aas_len); if (err != cudaSuccess) { destroy_prepared(batch); return (int)err; }
+    err = cudaMalloc((void**)&batch->params, n * sizeof(DpParams)); if (err != cudaSuccess) { destroy_prepared(batch); return (int)err; }
+    err = cudaMalloc((void**)&batch->results, n * sizeof(DpResult)); if (err != cudaSuccess) { destroy_prepared(batch); return (int)err; }
+    err = cudaMalloc((void**)&batch->matrix, 22 * 22); if (err != cudaSuccess) { destroy_prepared(batch); return (int)err; }
+
+    err = cudaMemcpy(batch->nas, nas, nas_len, cudaMemcpyHostToDevice); if (err != cudaSuccess) { destroy_prepared(batch); return (int)err; }
+    err = cudaMemcpy(batch->aas, aas, aas_len, cudaMemcpyHostToDevice); if (err != cudaSuccess) { destroy_prepared(batch); return (int)err; }
+    err = cudaMemcpy(batch->params, params, n * sizeof(DpParams), cudaMemcpyHostToDevice); if (err != cudaSuccess) { destroy_prepared(batch); return (int)err; }
+    err = cudaMemcpy(batch->matrix, matrix, 22 * 22, cudaMemcpyHostToDevice); if (err != cudaSuccess) { destroy_prepared(batch); return (int)err; }
+
+    *out = batch;
+    return (int)cudaSuccess;
+}
+
+extern "C" int miniprot_cuda_prepared_batch_run(
+    PreparedBatch* batch,
+    DpResult* results
+) {
+    if (!batch) return (int)cudaErrorInvalidValue;
+    int code = launch_dp(batch->nas, batch->aas, batch->params, batch->results, batch->matrix, batch->n, batch->noext);
+    if (code == cudaSuccess) code = (int)cudaDeviceSynchronize();
+    if (code == cudaSuccess) {
+        code = (int)cudaMemcpy(results, batch->results, batch->n * sizeof(DpResult), cudaMemcpyDeviceToHost);
+    }
+    return code;
+}
+
+extern "C" void miniprot_cuda_prepared_batch_destroy(PreparedBatch* batch) {
+    destroy_prepared(batch);
 }
 
 extern "C" int miniprot_cuda_bench_dispatch_only(
