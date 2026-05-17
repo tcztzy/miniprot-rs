@@ -538,13 +538,12 @@ src/gpu_bench.rs   — 综合 benchmark (CPU scalar + SIMD + Metal + wgpu + CUDA
 最终 gate：
 
 ```
-C oracle:             21.10s
-Rust CPU SIMD:        22.56s
-Rust --gpu gated:     22.05s
+C oracle:             20.96s
+Rust CPU SIMD:        22.14s
+Rust --gpu gated:     22.36s
 Rust CPU/--gpu PAF:   SHA256 identical
 
-[gpu] left_ext jobs=53  kernel=skip
-[gpu] right_ext jobs=543 kernel=skip
+[gpu] left_ext jobs=53 kernel=skip
 ```
 
 放宽 gate 的反例：

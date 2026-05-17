@@ -2,6 +2,9 @@
 
 ![End-to-end performance gap between Rust and the C oracle on real RefSeq data](docs/performance-gap.png)
 
+Current H800 end-to-end result: Rust does not yet beat the C oracle on the
+2000-query RefSeq map. This figure tracks the remaining gap, not a claimed win.
+
 > [!NOTE]
 > **AI Attribution:** The git history shows "Claude" in commit trailers, but this
 > naming is an artifact of how [Claude Code](https://github.com/anthropics/claude-code)
@@ -66,25 +69,31 @@ Dataset:
 - Query: first 2000 records from
   `/autodl-fs/data/refseq/uniprot_le100aa/GCF_000001405.40_Homo_sapiens_tax9606_uniprotkb_len001-100.fasta.gz`
 - Threads: `-t4`
-- CUDA build: `CUDA_HOME=/usr/local/cuda-12.8 cargo build --release --features cuda`
+- CUDA build:
+  `RUSTFLAGS="-C target-cpu=native" CUDA_HOME=/usr/local/cuda-12.8 cargo build --release --features cuda`
 - The H800 was shared during the final run; `nvidia-smi` showed a Python process
   using about 6.4 GB VRAM and 46-94% GPU util, so CUDA timings are conservative.
 
-| End-to-end map (`-t4`) | Wall time | vs Rust CPU | Notes |
+| End-to-end map (`-t4`) | Wall time | vs C oracle | Notes |
 |------------------------|----------:|------------:|-------|
-| C oracle v0.18-r281 | **21.10s** | 6.5% lower wall | Correctness oracle, not the Rust speed baseline |
-| Rust CPU SIMD | 22.56s | 1.0x | Latest Rust CPU baseline |
-| Rust `--gpu` auto-gated | 22.05s | **2.3% faster** | Rust CPU and `--gpu` PAF SHA256 match |
+| C oracle v0.18-r281 | **20.96s** | 1.0x | Correctness oracle; currently still faster for this map workload |
+| Rust CPU SIMD | 22.14s | 5.6% slower | Latest Rust CPU baseline after lightweight `cs` formatting cleanup |
+| Rust `--gpu` auto-gated | 22.36s | 6.7% slower | Rust CPU and `--gpu` PAF SHA256 match |
 
 `--gpu` is part of the production mapping path, but it is deliberately gated.
 It batches eligible extension-DP jobs across queries and sends them to CUDA only
 when the shape is profitable (`aa <= 128`, `nt <= 8192`, batch >=4096). On the
-2000-query RefSeq run, the mapper found only 53 left-extension and 543
-right-extension CUDA candidates, so both CUDA kernels were skipped and CPU SIMD
-handled the DP. A looser experimental gate (`nt <= 16384`) did run CUDA
+2000-query RefSeq run, the mapper found only 53 left-extension CUDA candidates,
+so the GPU path now exits early and CPU SIMD handles the alignment. A looser
+experimental gate (`nt <= 16384`) did run CUDA
 extension kernels (5182 left and 5233 right jobs) but slowed the same workload
 to 25.17s, despite byte-identical Rust PAF output. The current baseline
 therefore keeps the stricter gate.
+
+The chart is intentionally not a victory chart: on this larger real mapping
+case the Rust port still trails the C oracle. The gap is in alignment/traceback;
+candidate mapping alone remains faster in Rust (`-A -t4`: Rust 14.19s vs C
+15.23s on the same 2000-query dataset).
 
 ### x86_64 AutoDL (Xeon Platinum 8458P, real RefSeq, 2026-05-17)
 

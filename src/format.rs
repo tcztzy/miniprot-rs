@@ -111,6 +111,21 @@ fn push_nt_triplet(out: &mut String, nt: &[u8], offset: usize) {
     out.push(NT_I2C[nt[offset + 2] as usize] as char);
 }
 
+#[inline]
+fn push_usize(out: &mut String, mut value: usize) {
+    let mut buf = [0u8; 20];
+    let mut idx = buf.len();
+    loop {
+        idx -= 1;
+        buf[idx] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    out.push_str(std::str::from_utf8(&buf[idx..]).expect("decimal digits"));
+}
+
 fn append_cs(out: &mut String, tables: &Tables, nt: &[u8], aa: &[u8], cigar: &[u32]) {
     out.push_str("cs:Z:");
     let mut nt_offset = 0usize;
@@ -132,7 +147,7 @@ fn append_cs(out: &mut String, tables: &Tables, nt: &[u8], aa: &[u8], cigar: &[u
                     if nt_aa != aa_aa {
                         if match_run_len > 0 {
                             out.push(':');
-                            let _ = write!(out, "{match_run_len}");
+                            push_usize(out, match_run_len);
                         }
                         out.push('*');
                         push_lower_nts(out, codon_nt);
@@ -144,7 +159,7 @@ fn append_cs(out: &mut String, tables: &Tables, nt: &[u8], aa: &[u8], cigar: &[u
                 }
                 if match_run_len > 0 {
                     out.push(':');
-                    let _ = write!(out, "{match_run_len}");
+                    push_usize(out, match_run_len);
                 }
                 nt_offset += len3;
                 aa_offset += len;
@@ -182,7 +197,7 @@ fn append_cs(out: &mut String, tables: &Tables, nt: &[u8], aa: &[u8], cigar: &[u
                 out.push('~');
                 out.push(lower_nt(nt[nt_offset + lshift]));
                 out.push(lower_nt(nt[nt_offset + lshift + 1]));
-                let _ = write!(out, "{}", len - (lshift + rshift));
+                push_usize(out, len - (lshift + rshift));
                 out.push(lower_nt(nt[nt_offset + len - rshift - 2]));
                 out.push(lower_nt(nt[nt_offset + len - rshift - 1]));
                 if rshift > 0 {
@@ -200,7 +215,7 @@ fn append_cs(out: &mut String, tables: &Tables, nt: &[u8], aa: &[u8], cigar: &[u
 }
 
 pub(crate) fn build_cs(tables: &Tables, nt: &[u8], aa: &[u8], cigar: &[u32]) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(16 + aa.len() * 4 + cigar.len() * 8);
     append_cs(&mut out, tables, nt, aa, cigar);
     out
 }

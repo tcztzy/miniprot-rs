@@ -1192,14 +1192,21 @@ pub fn align_batches(
             left_gpu[idx] = Some(left_batch.params.len() - 1);
         }
     }
+    if !left_batch.is_profitable() {
+        if gpu_stats {
+            eprintln!("[gpu] left_ext jobs={} kernel=skip", left_batch.len());
+        }
+        works
+            .par_iter_mut()
+            .for_each(|work| finish_work_cpu(opt, tables, &groups, work));
+        return collect_finished_works(works, out);
+    }
     let left_start = std::time::Instant::now();
-    let left_run = left_batch.is_profitable();
     let left_results = left_batch.run(&left_opt);
     if gpu_stats {
         eprintln!(
-            "[gpu] left_ext jobs={} kernel={} time={:.3}s",
+            "[gpu] left_ext jobs={} kernel=run time={:.3}s",
             left_batch.len(),
-            if left_run { "run" } else { "skip" },
             left_start.elapsed().as_secs_f64()
         );
     }
