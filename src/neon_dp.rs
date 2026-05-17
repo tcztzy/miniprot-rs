@@ -527,9 +527,21 @@ mod aarch64 {
         let mut d2 = vec![neg; slen];
         let mut d3 = vec![neg; slen];
         let has_splice = prep.has_splice;
-        let mut a = if has_splice { vec![neg; slen] } else { Vec::new() };
-        let mut b = if has_splice { vec![neg; slen] } else { Vec::new() };
-        let mut c = if has_splice { vec![neg; slen] } else { Vec::new() };
+        let mut a = if has_splice {
+            vec![neg; slen]
+        } else {
+            Vec::new()
+        };
+        let mut b = if has_splice {
+            vec![neg; slen]
+        } else {
+            Vec::new()
+        };
+        let mut c = if has_splice {
+            vec![neg; slen]
+        } else {
+            Vec::new()
+        };
         let mut tb = if need_trace {
             vec![zero; nl * slen]
         } else {

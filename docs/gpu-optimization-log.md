@@ -502,6 +502,69 @@ src/gpu_bench.rs   — 综合 benchmark (CPU scalar + SIMD + Metal + wgpu + CUDA
 
 ---
 
+## 实验 15：CUDA extension DP 接入端到端 mapper
+
+### 目标
+
+把 GPU 从 microbenchmark 正式接进 mapping 流程，而不是只测试孤立 DP：
+
+- `--gpu` CLI 开关进入生产路径
+- 跨 query 收集 left/right extension DP job
+- CUDA kernel 支持 donor/acceptor splice penalty 和 extension best-prefix 返回
+- 不适合 GPU 的 job 回退 CPU SIMD，并保持 Rust CPU / Rust `--gpu` PAF 一致
+
+### 实现
+
+- `MapOptions::use_gpu` 和 CLI `--gpu`
+- `align_batches()`：按 query chunk 批量准备 alignment work，再统一收集 extension DP
+- `CudaDpBatch`：打包 `nas/aas/donor/acceptor/params`
+- `miniprot_cuda_batch_dp_splice()`：H800 上执行 extension DP，返回 `score/nt_len/aa_len`
+- gate：
+  - `aa <= 128`
+  - `nt <= 8192`
+  - batch >=4096
+  - CIGAR/traceback 仍由 CPU 完成
+- `MINIPROT_GPU_STATS=1` 输出候选 job 数、kernel run/skip、CPU fallback 数
+
+### 真实 RefSeq 端到端结果
+
+环境：
+
+- Reference: `/root/grch38_gpu_test.mpi` (GRCh38.p14)
+- Query: `/root/human_uniprot_le100_first2000.fa`
+- Threads: `-t4`
+- H800 上有外部 Python 进程占用约 6.4GB VRAM，GPU util 46-94%
+
+最终 gate：
+
+```
+C oracle:             21.10s
+Rust CPU SIMD:        22.56s
+Rust --gpu gated:     22.05s
+Rust CPU/--gpu PAF:   SHA256 identical
+
+[gpu] left_ext jobs=53  kernel=skip
+[gpu] right_ext jobs=543 kernel=skip
+```
+
+放宽 gate 的反例：
+
+```
+CUDA_MAX_NL=16384:
+[gpu] left_ext jobs=5182  kernel=run  time=0.660s
+[gpu] right_ext jobs=5233 kernel=run  time=0.592s
+Rust --gpu: 25.17s
+```
+
+结论：当前 one-thread-per-DP CUDA extension kernel 对真实 RefSeq 的长窗口
+extension DP 不划算。真实端到端 baseline 采用严格 gate：只有足够多短窗口
+DP 才进 CUDA，否则 CPU SIMD 更快。CUDASW++ 的 prepared/resident 思路对重复
+同一 batch 有效，但当前 mapper 的输入每批都不同，不能直接替换 splice-aware
+miniprot DP；后续如果继续做 GPU，应转向 warp/CTA 内并行的单 DP wavefront，而
+不是继续扩张 one-thread-per-DP 的适用范围。
+
+---
+
 ## 所有优化总表
 
 | 实验 | 方法 | 是否正确 | Batch 256 | Batch 1024 | Batch 4096 | 结论 |
@@ -520,6 +583,7 @@ src/gpu_bench.rs   — 综合 benchmark (CPU scalar + SIMD + Metal + wgpu + CUDA
 | 12 | CUDA/H800 + 32 threads/block | ✓ ext=false | **10ms** | **11ms** | **16ms** | H800 上大幅超过 CPU SIMD |
 | 13 | CUDA no-ext kernel + reusable buffers | ✓ ext=false | **10ms** | **10ms** | **15ms** | 小幅提升, 新 H800 baseline |
 | 14 | CUDA prepared batch | ✓ ext=false | — | — | — | 重复 8192 batch avg **11.41ms**, 新 H800 repeated baseline |
+| 15 | CUDA extension 接入 mapper + gate | ✓ Rust PAF identical | — | — | — | 真实 RefSeq 严格 gate, 放宽会端到端变慢 |
 
 当前最佳 Metal 在该 benchmark 上超过 CPU NEON SIMD：batch 4096 为 86.81ms vs NEON 110.46ms，batch 8192 为 199.39ms vs NEON 224.47ms。
 

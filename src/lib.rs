@@ -12,8 +12,8 @@ mod metal_dp;
 mod neon_dp;
 #[cfg_attr(any(target_arch = "aarch64", target_arch = "x86_64"), allow(dead_code))]
 mod scalar_dp;
-mod sse_dp;
 mod seqdb;
+mod sse_dp;
 mod wgpu_dp;
 
 mod sketch;

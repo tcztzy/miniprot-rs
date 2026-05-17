@@ -114,6 +114,7 @@ fn run_cpu_scalar(data: &BenchData, is_ext: bool) -> (Vec<DpResult>, std::time::
             let ns = &data.ns_raw[i];
             let aa = &data.aa_raw[i];
             let opt = crate::align::NsOpt {
+                use_gpu: false,
                 flag,
                 go: 11,
                 ge: 1,
@@ -152,6 +153,7 @@ fn run_cpu_neon(data: &BenchData, is_ext: bool) -> (Vec<DpResult>, std::time::Du
             let ns = &data.ns_raw[i];
             let aa = &data.aa_raw[i];
             let opt = crate::align::NsOpt {
+                use_gpu: false,
                 flag,
                 go: 11,
                 ge: 1,
@@ -580,6 +582,12 @@ fn bench_cuda_repeated_batch() {
         format_dur(scalar_time),
         format_dur(scalar_time / 8192)
     );
+    let (_simd_results, simd_time) = run_cpu_neon(&data, false);
+    eprintln!(
+        "  CPU SIMD:   {} total, {}/call",
+        format_dur(simd_time),
+        format_dur(simd_time / 8192)
+    );
 
     eprintln!("  normal batch path:");
     let mut times = Vec::new();
@@ -600,9 +608,10 @@ fn bench_cuda_repeated_batch() {
     let best = steady.iter().copied().min().unwrap();
     let avg = steady.iter().sum::<std::time::Duration>() / steady.len() as u32;
     eprintln!(
-        "    steady best: {}, avg: {}",
+        "    steady best: {}, avg: {} ({:.1}x CPU SIMD avg)",
         format_dur(best),
-        format_dur(avg)
+        format_dur(avg),
+        simd_time.as_secs_f64() / avg.as_secs_f64().max(1e-9)
     );
 
     let start = Instant::now();
@@ -633,9 +642,10 @@ fn bench_cuda_repeated_batch() {
     let best = steady.iter().copied().min().unwrap();
     let avg = steady.iter().sum::<std::time::Duration>() / steady.len() as u32;
     eprintln!(
-        "    steady best: {}, avg: {}",
+        "    steady best: {}, avg: {} ({:.1}x CPU SIMD avg)",
         format_dur(best),
-        format_dur(avg)
+        format_dur(avg),
+        simd_time.as_secs_f64() / avg.as_secs_f64().max(1e-9)
     );
 }
 

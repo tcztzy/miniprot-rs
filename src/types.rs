@@ -333,6 +333,7 @@ impl IndexOptions {
 #[derive(Clone, Debug)]
 pub struct MapOptions {
     pub flag: u32,
+    pub use_gpu: bool,
     pub mini_batch_size: i64,
     pub max_occ: i32,
     pub max_gap: i32,
@@ -384,6 +385,7 @@ impl MapOptions {
     pub fn new() -> Self {
         let mut opt = Self {
             flag: 0,
+            use_gpu: false,
             mini_batch_size: 2_000_000,
             max_occ: 20_000,
             max_gap: 1_000,

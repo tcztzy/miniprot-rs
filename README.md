@@ -1,5 +1,7 @@
 # miniprot (Rust port)
 
+![End-to-end performance gap between Rust and the C oracle on real RefSeq data](docs/performance-gap.png)
+
 > [!NOTE]
 > **AI Attribution:** The git history shows "Claude" in commit trailers, but this
 > naming is an artifact of how [Claude Code](https://github.com/anthropics/claude-code)
@@ -9,7 +11,7 @@
 > The actual development was:
 > - **Architecture & design:** [Codex](https://openai.com/index/introducing-codex/) + GPT
 > - **Implementation & optimization:** [Claude Code](https://claude.ai/code) (the CLI tool) + [DeepSeek](https://www.deepseek.com/)
-- **GPU kernel tuning:** GPT 5.5 — pointer rotation, score row cache, SIMT memory optimization
+> - **GPU kernel tuning:** GPT 5.5 — pointer rotation, score row cache, SIMT memory optimization
 >
 > Anthropic's Claude model had negligible involvement. Credit where credit is due.
 
@@ -47,10 +49,86 @@ cargo build --release
 
 ## Performance
 
-Benchmarked against upstream C oracle (`lh3/miniprot` v0.18-r281) on human
-genome GRCh38.p14 (`GCF_000001405.40`, 928 MB gzipped FASTA). Both binaries
-compiled with arch-native flags (`-C target-cpu=native` / `-march=native
--mtune=native`). 200 protein queries derived from chromosome 1 ORFs.
+Benchmarked against upstream C oracle (`lh3/miniprot` v0.18-r281). Both
+binaries are compiled with arch-native flags (`-C target-cpu=native` /
+`-march=native -mtune=native`) unless noted otherwise.
+
+### AutoDL H800 Host (real RefSeq end-to-end map, 2026-05-17)
+
+This is the primary end-to-end GPU integration benchmark. It measures full
+mapping, including index load, candidate mapping, extension DP, traceback,
+ranking, and PAF formatting.
+
+Dataset:
+
+- Reference index: `/root/grch38_gpu_test.mpi`, built from
+  `/autodl-fs/data/refseq/GCF_000001405.40_GRCh38.p14_genomic.fna.gz`
+- Query: first 2000 records from
+  `/autodl-fs/data/refseq/uniprot_le100aa/GCF_000001405.40_Homo_sapiens_tax9606_uniprotkb_len001-100.fasta.gz`
+- Threads: `-t4`
+- CUDA build: `CUDA_HOME=/usr/local/cuda-12.8 cargo build --release --features cuda`
+- The H800 was shared during the final run; `nvidia-smi` showed a Python process
+  using about 6.4 GB VRAM and 46-94% GPU util, so CUDA timings are conservative.
+
+| End-to-end map (`-t4`) | Wall time | vs Rust CPU | Notes |
+|------------------------|----------:|------------:|-------|
+| C oracle v0.18-r281 | **21.10s** | 6.5% lower wall | Correctness oracle, not the Rust speed baseline |
+| Rust CPU SIMD | 22.56s | 1.0x | Latest Rust CPU baseline |
+| Rust `--gpu` auto-gated | 22.05s | **2.3% faster** | Rust CPU and `--gpu` PAF SHA256 match |
+
+`--gpu` is part of the production mapping path, but it is deliberately gated.
+It batches eligible extension-DP jobs across queries and sends them to CUDA only
+when the shape is profitable (`aa <= 128`, `nt <= 8192`, batch >=4096). On the
+2000-query RefSeq run, the mapper found only 53 left-extension and 543
+right-extension CUDA candidates, so both CUDA kernels were skipped and CPU SIMD
+handled the DP. A looser experimental gate (`nt <= 16384`) did run CUDA
+extension kernels (5182 left and 5233 right jobs) but slowed the same workload
+to 25.17s, despite byte-identical Rust PAF output. The current baseline
+therefore keeps the stricter gate.
+
+### x86_64 AutoDL (Xeon Platinum 8458P, real RefSeq, 2026-05-17)
+
+Dataset:
+
+- Reference: `/autodl-fs/data/refseq/GCF_000001405.40_GRCh38.p14_genomic.fna.gz`
+  (GRCh38.p14, 928 MB gzipped FASTA)
+- Query: first 200 records from
+  `/autodl-fs/data/refseq/uniprot_le100aa/GCF_000001405.40_Homo_sapiens_tax9606_uniprotkb_len001-100.fasta.gz`
+- Median of 3 measured samples; index outputs and the shared map index were
+  written to `/root` scratch so shared-filesystem write latency is not counted
+  as implementation time.
+- Mapping uses the same C-built `.mpi` for both binaries.
+
+| Phase | C oracle | Rust | Rust vs C |
+|-------|---------:|-----:|----------:|
+| Index build (`-t 4`) | 105.60s | **60.55s** | **42.7% faster** |
+| Default map (`-t 1`) | 9.54s | **9.13s** | **4.3% faster** |
+| Default map (`-t 4`) | **5.66s** | 5.71s | 1.0% slower |
+| No-align map (`-A -t 1`) | 7.21s | **7.11s** | **1.4% faster** |
+| No-align map (`-A -t 4`) | **5.61s** | 5.63s | 0.3% slower |
+
+On the same AutoDL H800 machine, the CUDA prepared-batch DP benchmark shows the
+GPU path's compute headroom for the short-window, large-batch shape it is meant
+to accept. These are isolated DP microbenchmarks, not end-to-end mapping claims:
+
+| DP workload (`batch=8192, nl=3000, al=50`) | Best observed | Final noisy rerun |
+|--------------------------------------------|--------------:|------------------:|
+| CPU scalar | 7.06s | - |
+| CPU SIMD | 348.85ms | 344.79ms |
+| CUDA normal repeated batch, steady avg | 27.69ms | 21.47ms |
+| CUDA prepared resident batch, steady avg | **10.91ms** | 25.91ms |
+
+The final rerun happened while another process was actively using the H800.
+Even under contention, isolated CUDA DP remained much faster than CPU SIMD; the
+production mapper still avoids CUDA for real RefSeq extension windows unless
+the full batch shape is profitable end to end.
+
+On this broader real-data query set, PAF output is not byte-identical to the C
+oracle. Sorted `-A` output differs by 1 line out of 274; sorted default output
+has 266 common lines, 10 C-only lines, and 3 Rust-only lines. This project does
+not treat byte-for-byte identity with upstream C as a correctness guarantee, but
+the divergence should be considered when using the C oracle as a strict
+regression checker.
 
 ### aarch64 (Apple M2, 4 threads)
 
@@ -60,7 +138,7 @@ compiled with arch-native flags (`-C target-cpu=native` / `-march=native
 | Map (1t, CPU)    | 6.26s    | **5.23s** | **16.5% faster** |
 | Map (4t, CPU)    | 8.92s    | **6.10s** | **31.6% faster** |
 
-### x86_64 (Intel Xeon Gold 5320, Ice Lake, 4 threads)
+### Historical x86_64 (Intel Xeon Gold 5320, Ice Lake, 4 threads)
 
 | Phase            | C oracle | Rust     | Rust vs C    |
 |------------------|---------:|---------:|-------------:|
@@ -91,23 +169,26 @@ compiled with arch-native flags (`-C target-cpu=native` / `-march=native
 - **GPU-accelerated DP** — Metal and CUDA compute kernels with int16 arrays,
   pointer rotation, score row cache, optimised launch sizing, and prepared
   CUDA batches. Metal surpasses NEON SIMD at batch ≥4096 on Apple M2; CUDA on
-  H800 surpasses CPU SIMD at batch ≥256. Cross-platform via wgpu
-  (Vulkan/Metal/DX12).
+  H800 surpasses CPU SIMD in isolated splice-free DP microbenchmarks. The
+  end-to-end mapper uses CUDA only behind a profitability gate.
+  Cross-platform via wgpu (Vulkan/Metal/DX12).
   See [GPU optimization log](docs/gpu-optimization-log.md) for full
   experiment history.
 
 ### GPU-Accelerated DP (Metal / Vulkan / DX12 / CUDA)
 
 GPU backends for batched DP computation. At batch ≥4096, **Metal GPU surpasses
-NEON SIMD** on Apple M2. On NVIDIA H800, the CUDA backend surpasses CPU SIMD
-from batch 256 and reaches ~15× at batch 8192.
+NEON SIMD** on Apple M2. On NVIDIA H800, the CUDA backend surpasses CPU SIMD in
+the splice-free DP sweep and reaches ~15× at batch 8192. Production `--gpu`
+mapping is stricter because real extension DP includes varied window lengths,
+splice penalties, host/device transfers, and CPU traceback work.
 
 | Backend | API | Shader | Platform | Host LOC | Shader LOC |
 |---------|-----|--------|----------|----------|------------|
 | CPU NEON/SSE | Rust intrinsics | — | ARM / x86_64 | — | — |
 | **Metal** | metal-rs (raw) | MSL | macOS only | 276 | 128 |
-| **wgpu** | wgpu (cross) | WGSL | macOS/Linux/Windows | 387 | 192 |
-| **CUDA** | FFI + nvcc | CUDA C++ | NVIDIA GPUs | 145 | 278 |
+| **wgpu** | wgpu (cross) | WGSL | macOS/Linux/Windows | 381 | 192 |
+| **CUDA** | FFI + nvcc | CUDA C++ | NVIDIA GPUs | 312 | 719 |
 
 #### Batch Size Sweep (nl=3000, al=50, Apple M2, all 100% correct)
 
@@ -149,8 +230,9 @@ overridden via environment variables.
 At batch 8192: CUDA 21.74ms total vs CPU SIMD 341.96ms. The first batch pays
 CUDA context initialization, so small-batch latency is not representative. For
 repeated 8192-call batches, the CUDASW++-style prepared-batch path uploads
-`nas/aas/params/matrix` once and then reruns the resident workload at 11.41ms
-steady-state average (best observed: 10.50ms).
+`nas/aas/params/matrix` once and then reruns the resident workload with a
+best-observed steady-state average of 10.91ms (best iteration: 10.42ms), 32.0x
+faster than CPU SIMD on the same uncontended workload.
 
 #### GPU kernel optimizations
 
@@ -168,7 +250,10 @@ steady-state average (best observed: 10.50ms).
   only when needed, reducing repeated-batch allocation overhead
 - **Prepared CUDA batches** — keeps a repeated batch's input and scoring matrix
   resident on the H800, reducing steady-state 8192-call batches from 13.16ms to
-  11.41ms average
+  10.91ms average
+- **Production CUDA extension hook** — batches eligible left/right extension DP
+  across queries, uses donor/acceptor splice penalties, and falls back to CPU
+  SIMD for small batches, long windows, CIGAR/traceback, or failed CUDA runs
 - **No-copy input buffers** — `new_buffer_with_bytes_no_copy` wraps host slices directly
   on Apple Silicon unified memory
 - **Dead store elimination** — remove per-row zero-fill that gets overwritten
@@ -184,10 +269,11 @@ CUDA_HOME=/usr/local/cuda-12.8 cargo test --release --features cuda bench_cuda_r
 
 Performance baseline is the current Rust implementation. GPU regressions
 measured against current Metal shader, not against C oracle. CPU NEON SIMD
-is the single-query baseline; GPU DP is the high-batch baseline. The current
-GPU benchmark correctness claim covers the splice-free non-extension DP path
-(`ext=false`); extension mode remains a known limitation shared by Metal, wgpu,
-and CUDA.
+is the single-query baseline; GPU DP is the high-batch baseline. The Metal and
+wgpu benchmark correctness claim covers the splice-free non-extension DP path
+(`ext=false`). CUDA additionally has the gated production extension-DP path used
+by `--gpu`; real end-to-end speed still decides whether that path is enabled for
+a batch.
 
 CPU benchmarks (vs C oracle):
 

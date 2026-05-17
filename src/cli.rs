@@ -54,6 +54,8 @@ struct Args {
     trans: bool,
     #[arg(long = "no-cs", action = ArgAction::SetTrue)]
     no_cs: bool,
+    #[arg(long = "gpu", action = ArgAction::SetTrue, help = "Use CUDA for eligible batched extension DP")]
+    gpu: bool,
     #[arg(short = 'P', default_value = "MP")]
     gff_prefix: String,
     #[arg(short = 'O')]
@@ -189,6 +191,7 @@ where
         mini_batch_size: args.mini_batch_size,
         ..MapOptions::new()
     };
+    mo.use_gpu = args.gpu;
     let mut keep_io = false;
     let explicit_max_intron = args.max_intron.is_some();
     if let Some(max_intron) = args.max_intron {

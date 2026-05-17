@@ -4,7 +4,7 @@ use crate::tables::{
     AA_I2C, Kind, NS_F_CIGAR, NS_F_EXT_LEFT, NS_F_EXT_RIGHT, Tables, pack_cigar_op, unpack_cigar_op,
 };
 use crate::types::{
-    Alignment, AlignmentExtra, Anchor, Feature, FeatureType, MP_F_NO_CS, MapOptions,
+    Alignment, AlignmentExtra, Anchor, Extents, Feature, FeatureType, MP_F_NO_CS, MapOptions,
 };
 
 pub(crate) const AA_STOP: u8 = 20;
@@ -12,6 +12,7 @@ const AA_AMBI: u8 = 21;
 
 #[derive(Clone, Copy)]
 pub(crate) struct NsOpt<'a> {
+    pub(crate) use_gpu: bool,
     pub(crate) flag: i32,
     pub(crate) go: i32,
     pub(crate) ge: i32,
@@ -85,6 +86,7 @@ fn map_to_ns_opt<'a>(opt: &'a MapOptions, tables: &'a Tables, flag: i32) -> NsOp
         *item = (*item as f32 * opt.sp_scale + 0.499) as i32;
     }
     NsOpt {
+        use_gpu: opt.use_gpu,
         flag,
         go: opt.go,
         ge: opt.ge,
@@ -120,6 +122,113 @@ fn scalar_dp(ns: &[u8], aa: &[u8], opt: &NsOpt<'_>, ss: Option<&[u8]>) -> NsResu
         return NsResult::default();
     }
     crate::neon_dp::global_gs16b(ns, aa, opt, ss)
+}
+
+const CUDA_MAX_AL: usize = 128;
+const CUDA_MAX_NL: usize = 8192;
+const CUDA_MIN_BATCH: usize = 4096;
+
+#[derive(Default)]
+struct CudaDpBatch {
+    nas: Vec<u8>,
+    aas: Vec<u8>,
+    donor: Vec<i16>,
+    acceptor: Vec<i16>,
+    params: Vec<crate::cuda_dp::SpliceDpParams>,
+}
+
+impl CudaDpBatch {
+    fn push(&mut self, ns: &[u8], aa: &[u8], opt: &NsOpt<'_>, ss: Option<&[u8]>) -> bool {
+        if !opt.use_gpu
+            || aa.is_empty()
+            || ns.is_empty()
+            || aa.len() > CUDA_MAX_AL
+            || ns.len() > CUDA_MAX_NL
+        {
+            return false;
+        }
+        let prep = crate::scalar_dp::prepare_dp_seq(ns, aa, opt, ss);
+        if prep.aas.is_empty()
+            || prep.nas.len() < 2
+            || prep.aas.len() > CUDA_MAX_AL
+            || prep.nas.len() > CUDA_MAX_NL
+        {
+            return false;
+        }
+        let sp_default = opt.sp[3];
+        let has_splice = prep.donor[..prep.nas.len()]
+            .iter()
+            .any(|&d| d != sp_default)
+            || prep.acceptor[..prep.nas.len()]
+                .iter()
+                .any(|&a| a != sp_default);
+        let nas_offset = self.nas.len() as u32;
+        let aas_offset = self.aas.len() as u32;
+        let donor_offset = self.donor.len() as u32;
+        let acceptor_offset = self.acceptor.len() as u32;
+        self.nas.extend_from_slice(&prep.nas);
+        self.aas.extend_from_slice(&prep.aas);
+        self.donor.extend(
+            prep.donor
+                .iter()
+                .map(|&x| x.clamp(i16::MIN as i32, i16::MAX as i32) as i16),
+        );
+        self.acceptor.extend(
+            prep.acceptor
+                .iter()
+                .map(|&x| x.clamp(i16::MIN as i32, i16::MAX as i32) as i16),
+        );
+        self.params.push(crate::cuda_dp::SpliceDpParams {
+            nas_offset,
+            aas_offset,
+            donor_offset,
+            acceptor_offset,
+            nl: prep.nas.len() as u32,
+            al: prep.aas.len() as u32,
+            go: opt.go,
+            ge: opt.ge,
+            io: opt.io,
+            fs: opt.fs,
+            has_splice: i32::from(has_splice),
+            end_bonus: opt.end_bonus,
+            flag: opt.flag,
+            xdrop: opt.xdrop,
+            ie_coef: opt.ie_coef,
+        });
+        true
+    }
+
+    fn len(&self) -> usize {
+        self.params.len()
+    }
+
+    fn is_profitable(&self) -> bool {
+        self.params.len() >= CUDA_MIN_BATCH
+    }
+
+    fn run(&self, opt: &NsOpt<'_>) -> Option<Vec<NsResult>> {
+        if !self.is_profitable() {
+            return None;
+        }
+        let raw = crate::cuda_dp::batch_dp_splice_with_matrix(
+            &self.nas,
+            &self.aas,
+            &self.donor,
+            &self.acceptor,
+            &self.params,
+            opt.sc,
+        )?;
+        raw.into_iter()
+            .map(|result| {
+                (result.score != -1).then_some(NsResult {
+                    cigar: Vec::new(),
+                    nt_len: result.nt_len,
+                    aa_len: result.aa_len,
+                    score: result.score,
+                })
+            })
+            .collect()
+    }
 }
 
 fn low31(anchor: Anchor) -> i32 {
@@ -496,6 +605,54 @@ pub fn select_multi_exon(regs: &mut [Alignment], single_penalty: i32) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn finish_aligned_reg(
+    opt: &MapOptions,
+    tables: &Tables,
+    qlen: i32,
+    aa: &[u8],
+    reg: &mut Alignment,
+    nt: &[u8],
+    as_: i64,
+    ae: i64,
+    cigar: CigarBuilder,
+    score: i32,
+) {
+    let cs = if (opt.flag & MP_F_NO_CS) == 0 {
+        build_cs(
+            tables,
+            &nt[(reg.vs - as_) as usize..(reg.ve - as_) as usize],
+            &aa[reg.qs as usize..reg.qe as usize],
+            &cigar.cigar,
+        )
+    } else {
+        String::new()
+    };
+
+    reg.extra = Some(AlignmentExtra {
+        dp_score: score,
+        cigar: cigar.cigar,
+        cs,
+        ..AlignmentExtra::default()
+    });
+    let dist_stop = extra_stop(reg, nt, as_, ae, tables);
+    let dist_start = extra_start(reg, nt, as_, ae, tables);
+    if let Some(extra) = reg.extra.as_mut() {
+        extra.dist_stop = dist_stop;
+        extra.dist_start = dist_start;
+    }
+    if !extra_cal(
+        reg,
+        opt,
+        tables,
+        &nt[(reg.vs - as_) as usize..],
+        &aa[reg.qs as usize..],
+        qlen,
+    ) {
+        reg.invalidate();
+    }
+}
+
 pub fn align_reg(
     mi: &Index,
     opt: &MapOptions,
@@ -667,37 +824,498 @@ pub fn align_reg(
         reg.qe += aa_len;
     }
 
-    let cs = if (opt.flag & MP_F_NO_CS) == 0 {
-        build_cs(
-            tables,
-            &nt[(reg.vs - as_) as usize..(reg.ve - as_) as usize],
-            &aa[reg.qs as usize..reg.qe as usize],
-            &cigar.cigar,
-        )
-    } else {
-        String::new()
+    finish_aligned_reg(opt, tables, qlen, aa, reg, &nt, as_, ae, cigar, score);
+}
+
+struct AlignWork {
+    group_idx: usize,
+    reg: Alignment,
+    nt: Vec<u8>,
+    ss_buf: Option<Vec<u8>>,
+    as_: i64,
+    ae: i64,
+    vs0: i64,
+    i0: usize,
+    ne0: i32,
+    ae0: i32,
+    score: i32,
+    cigar: CigarBuilder,
+}
+
+fn prepare_align_work(
+    mi: &Index,
+    opt: &MapOptions,
+    qlen: i32,
+    reg: &mut Alignment,
+    extl0: i32,
+    extr0: i32,
+) -> Option<AlignWork> {
+    if reg.cnt == 0 || reg.anchors.is_empty() {
+        reg.invalidate();
+        return None;
+    }
+
+    filter_seed(&mut reg.anchors, 6, 3, opt.kmer2, opt.kmer2 + 1);
+    let Some(i0) = reg
+        .anchors
+        .iter()
+        .position(|anchor| anchor.has_query_flag())
+    else {
+        reg.invalidate();
+        return None;
     };
 
-    reg.extra = Some(AlignmentExtra {
-        dp_score: score,
-        cigar: cigar.cigar,
-        cs,
-        ..AlignmentExtra::default()
-    });
-    let dist_stop = extra_stop(reg, &nt, as_, ae, tables);
-    let dist_start = extra_start(reg, &nt, as_, ae, tables);
-    if let Some(extra) = reg.extra.as_mut() {
-        extra.dist_stop = dist_stop;
-        extra.dist_start = dist_start;
+    let mut extl = opt.max_ext;
+    let mut extr = opt.max_ext;
+    if reg.qs >= 10 {
+        extl = opt.max_intron / 2;
     }
-    if !extra_cal(
-        reg,
+    if qlen - reg.qe >= 10 {
+        extr = opt.max_intron / 2;
+    }
+    if extl0 > 0 {
+        extl = extl.min(extl0);
+    }
+    if extr0 > 0 {
+        extr = extr.min(extr0);
+    }
+
+    let ctg_len = mi.nt.contigs[reg.vid.contig().index()].len;
+    let as_ = if reg.vs > extl as i64 {
+        reg.vs - extl as i64
+    } else {
+        0
+    };
+    let ae = (reg.ve + extr as i64).min(ctg_len);
+    let mut nt = vec![0u8; (ae - as_) as usize];
+    let Ok(l_nt) = mi.nt.get_by_v(reg.vid, as_, ae, &mut nt) else {
+        reg.invalidate();
+        return None;
+    };
+    if l_nt != ae - as_ {
+        reg.invalidate();
+        return None;
+    }
+    let ss_buf = if mi.nt.has_spsc() {
+        let mut ss = vec![0u8; (ae - as_) as usize];
+        let Ok(l_ss) = mi.nt.spsc_get_by_v(reg.vid, as_, ae, &mut ss) else {
+            reg.invalidate();
+            return None;
+        };
+        if l_ss != l_nt {
+            reg.invalidate();
+            return None;
+        }
+        Some(ss)
+    } else {
+        None
+    };
+    let vs0 = reg.vs;
+    Some(AlignWork {
+        group_idx: 0,
+        reg: std::mem::take(reg),
+        nt,
+        ss_buf,
+        as_,
+        ae,
+        vs0,
+        i0,
+        ne0: 0,
+        ae0: 0,
+        score: 0,
+        cigar: CigarBuilder::default(),
+    })
+}
+
+fn left_extension_cpu(
+    opt: &MapOptions,
+    tables: &Tables,
+    aa: &[u8],
+    work: &AlignWork,
+) -> (i32, i32) {
+    let vs1 = work.vs0 + i64::from(work.reg.anchors[work.i0].target()) + 1;
+    let as1 = low31(work.reg.anchors[work.i0]) + 1;
+    let ss = work.ss_buf.as_deref();
+    let mut ns_opt = map_to_ns_opt(opt, tables, NS_F_EXT_LEFT);
+    let mut rst = scalar_dp(
+        &work.nt[..(vs1 - work.as_) as usize],
+        &aa[..as1 as usize],
+        &ns_opt,
+        ss,
+    );
+    let mut nt_len = rst.nt_len;
+    let mut aa_len = rst.aa_len;
+    if rst.aa_len != as1 && rst.nt_len < opt.max_ext && opt.io > opt.io_end {
+        let as_alt = if vs1 - work.as_ > opt.max_ext as i64 {
+            vs1 - opt.max_ext as i64
+        } else {
+            work.as_
+        };
+        ns_opt.io = opt.io_end;
+        rst = scalar_dp(
+            &work.nt[(as_alt - work.as_) as usize..(vs1 - work.as_) as usize],
+            &aa[..as1 as usize],
+            &ns_opt,
+            ss,
+        );
+        if rst.aa_len == as1 {
+            nt_len = rst.nt_len;
+            aa_len = rst.aa_len;
+        }
+    }
+    (nt_len, aa_len)
+}
+
+fn apply_left_extension(work: &mut AlignWork, nt_len: i32, aa_len: i32) {
+    let vs1 = work.vs0 + i64::from(work.reg.anchors[work.i0].target()) + 1;
+    let as1 = low31(work.reg.anchors[work.i0]) + 1;
+    work.reg.vs = vs1 - nt_len as i64;
+    work.reg.qs = as1 - aa_len;
+    work.ne0 = (work.reg.vs - work.vs0) as i32;
+    work.ae0 = work.reg.qs;
+}
+
+fn align_middle(opt: &MapOptions, tables: &Tables, aa: &[u8], work: &mut AlignWork) {
+    for anchor in work.reg.anchors.iter().skip(work.i0) {
+        if !anchor.has_query_flag() {
+            continue;
+        }
+        let ne1 = anchor.target() + 1;
+        let ae1 = low31(*anchor) + 1;
+        let nt_st = (work.ne0 as i64 + work.vs0 - work.as_) as usize;
+        let nt_en = (ne1 as i64 + work.vs0 - work.as_) as usize;
+        work.score += align_seq(
+            opt,
+            tables,
+            &work.nt[nt_st..nt_en],
+            &aa[work.ae0 as usize..ae1 as usize],
+            work.ss_buf.as_deref().map(|ss| &ss[nt_st..nt_en]),
+            &mut work.cigar,
+        );
+        work.ne0 = ne1;
+        work.ae0 = ae1;
+    }
+    work.reg.ve = work.ne0 as i64 + work.vs0;
+    work.reg.qe = work.ae0;
+}
+
+fn right_extension_cpu(
+    opt: &MapOptions,
+    tables: &Tables,
+    qlen: i32,
+    aa: &[u8],
+    work: &AlignWork,
+) -> Option<(i32, i32)> {
+    if work.reg.qe >= qlen || work.reg.ve >= work.ae {
+        return None;
+    }
+    let nt_start = (work.reg.ve - work.as_) as usize;
+    let ss = work.ss_buf.as_deref();
+    let mut ns_opt = map_to_ns_opt(opt, tables, NS_F_EXT_RIGHT);
+    let mut rst = scalar_dp(
+        &work.nt[nt_start..],
+        &aa[work.reg.qe as usize..],
+        &ns_opt,
+        ss.map(|ss| &ss[nt_start..]),
+    );
+    let mut nt_len = rst.nt_len;
+    let mut aa_len = rst.aa_len;
+    if aa_len < qlen - work.reg.qe && nt_len < opt.max_ext && opt.io > opt.io_end {
+        let l_ext = ((work.ae - work.reg.ve) as i32).min(opt.max_ext) as usize;
+        ns_opt.io = opt.io_end;
+        rst = scalar_dp(
+            &work.nt[nt_start..nt_start + l_ext],
+            &aa[work.reg.qe as usize..],
+            &ns_opt,
+            ss.map(|ss| &ss[nt_start..nt_start + l_ext]),
+        );
+        if rst.aa_len == qlen - work.reg.qe {
+            nt_len = rst.nt_len;
+            aa_len = rst.aa_len;
+        }
+    }
+    Some((nt_len, aa_len))
+}
+
+fn apply_right_extension(
+    opt: &MapOptions,
+    tables: &Tables,
+    aa: &[u8],
+    work: &mut AlignWork,
+    nt_len: i32,
+    aa_len: i32,
+) {
+    let nt_start = (work.reg.ve - work.as_) as usize;
+    work.score += align_seq(
         opt,
         tables,
-        &nt[(reg.vs - as_) as usize..],
-        &aa[reg.qs as usize..],
-        qlen,
-    ) {
-        reg.invalidate();
+        &work.nt[nt_start..nt_start + nt_len as usize],
+        &aa[work.reg.qe as usize..(work.reg.qe + aa_len) as usize],
+        work.ss_buf
+            .as_deref()
+            .map(|ss| &ss[nt_start..nt_start + nt_len as usize]),
+        &mut work.cigar,
+    );
+    work.reg.ve += nt_len as i64;
+    work.reg.qe += aa_len;
+}
+
+fn finish_work_cpu(
+    opt: &MapOptions,
+    tables: &Tables,
+    groups: &[AlignBatch<'_>],
+    work: &mut AlignWork,
+) {
+    let aa = groups[work.group_idx].aa;
+    let qlen = groups[work.group_idx].qlen;
+    let (nt_len, aa_len) = left_extension_cpu(opt, tables, aa, work);
+    apply_left_extension(work, nt_len, aa_len);
+    align_middle(opt, tables, aa, work);
+    if let Some((nt_len, aa_len)) = right_extension_cpu(opt, tables, qlen, aa, work) {
+        apply_right_extension(opt, tables, aa, work, nt_len, aa_len);
     }
+    finish_aligned_reg(
+        opt,
+        tables,
+        qlen,
+        aa,
+        &mut work.reg,
+        &work.nt,
+        work.as_,
+        work.ae,
+        std::mem::take(&mut work.cigar),
+        work.score,
+    );
+}
+
+fn collect_finished_works(
+    works: Vec<AlignWork>,
+    mut out: Vec<Vec<Alignment>>,
+) -> Vec<Vec<Alignment>> {
+    for work in works {
+        if work.reg.extra.is_some() {
+            out[work.group_idx].push(work.reg);
+        }
+    }
+    out
+}
+
+pub fn align_regs(
+    mi: &Index,
+    opt: &MapOptions,
+    qlen: i32,
+    aa: &[u8],
+    regs: Vec<Alignment>,
+    ext: Vec<Extents>,
+) -> Vec<Alignment> {
+    let mut groups = align_batches(
+        mi,
+        opt,
+        vec![AlignBatch {
+            qlen,
+            aa,
+            regs,
+            ext,
+        }],
+    );
+    groups.pop().unwrap_or_default()
+}
+
+pub struct AlignBatch<'a> {
+    pub qlen: i32,
+    pub aa: &'a [u8],
+    pub regs: Vec<Alignment>,
+    pub ext: Vec<Extents>,
+}
+
+pub fn align_batches(
+    mi: &Index,
+    opt: &MapOptions,
+    groups: Vec<AlignBatch<'_>>,
+) -> Vec<Vec<Alignment>> {
+    use rayon::prelude::*;
+
+    if !opt.use_gpu || !crate::cuda_dp::available() {
+        return groups
+            .into_iter()
+            .map(|group| {
+                group
+                    .regs
+                    .into_iter()
+                    .zip(group.ext)
+                    .filter_map(|(mut reg, ext)| {
+                        align_reg(mi, opt, group.qlen, group.aa, &mut reg, ext.left, ext.right);
+                        reg.extra.is_some().then_some(reg)
+                    })
+                    .collect()
+            })
+            .collect();
+    }
+
+    let tables = &mi.tables;
+    let gpu_stats = std::env::var_os("MINIPROT_GPU_STATS").is_some();
+    let out: Vec<Vec<Alignment>> = (0..groups.len()).map(|_| Vec::new()).collect();
+    let mut works = Vec::new();
+    for (group_idx, group) in groups.iter().enumerate() {
+        for (mut reg, ext) in group.regs.iter().cloned().zip(group.ext.iter().copied()) {
+            if let Some(mut work) =
+                prepare_align_work(mi, opt, group.qlen, &mut reg, ext.left, ext.right)
+            {
+                work.group_idx = group_idx;
+                works.push(work);
+            }
+        }
+    }
+    if works.is_empty() {
+        return out;
+    }
+    if works.len() < CUDA_MIN_BATCH {
+        works
+            .par_iter_mut()
+            .for_each(|work| finish_work_cpu(opt, tables, &groups, work));
+        return collect_finished_works(works, out);
+    }
+
+    let mut left_batch = CudaDpBatch::default();
+    let mut left_gpu = vec![None; works.len()];
+    let left_opt = map_to_ns_opt(opt, tables, NS_F_EXT_LEFT);
+    for (idx, work) in works.iter().enumerate() {
+        let aa = groups[work.group_idx].aa;
+        let vs1 = work.vs0 + i64::from(work.reg.anchors[work.i0].target()) + 1;
+        let as1 = low31(work.reg.anchors[work.i0]) + 1;
+        if left_batch.push(
+            &work.nt[..(vs1 - work.as_) as usize],
+            &aa[..as1 as usize],
+            &left_opt,
+            work.ss_buf.as_deref(),
+        ) {
+            left_gpu[idx] = Some(left_batch.params.len() - 1);
+        }
+    }
+    let left_start = std::time::Instant::now();
+    let left_run = left_batch.is_profitable();
+    let left_results = left_batch.run(&left_opt);
+    if gpu_stats {
+        eprintln!(
+            "[gpu] left_ext jobs={} kernel={} time={:.3}s",
+            left_batch.len(),
+            if left_run { "run" } else { "skip" },
+            left_start.elapsed().as_secs_f64()
+        );
+    }
+    let left_cpu_fallback = std::sync::atomic::AtomicUsize::new(0);
+    works.par_iter_mut().enumerate().for_each(|(idx, work)| {
+        let aa = groups[work.group_idx].aa;
+        let result = left_gpu[idx].and_then(|pos| {
+            left_results
+                .as_ref()
+                .and_then(|results| results.get(pos).cloned())
+        });
+        let Some(result) = result else {
+            left_cpu_fallback.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (nt_len, aa_len) = left_extension_cpu(opt, tables, aa, work);
+            apply_left_extension(work, nt_len, aa_len);
+            return;
+        };
+        let as1 = low31(work.reg.anchors[work.i0]) + 1;
+        if result.aa_len != as1 && result.nt_len < opt.max_ext && opt.io > opt.io_end {
+            left_cpu_fallback.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (nt_len, aa_len) = left_extension_cpu(opt, tables, aa, work);
+            apply_left_extension(work, nt_len, aa_len);
+        } else {
+            apply_left_extension(work, result.nt_len, result.aa_len);
+        }
+    });
+    if gpu_stats {
+        eprintln!(
+            "[gpu] left_ext cpu_fallback={}",
+            left_cpu_fallback.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    works.par_iter_mut().for_each(|work| {
+        align_middle(opt, tables, groups[work.group_idx].aa, work);
+    });
+
+    let mut right_batch = CudaDpBatch::default();
+    let mut right_gpu = vec![None; works.len()];
+    let right_opt = map_to_ns_opt(opt, tables, NS_F_EXT_RIGHT);
+    for (idx, work) in works.iter().enumerate() {
+        let qlen = groups[work.group_idx].qlen;
+        if work.reg.qe >= qlen || work.reg.ve >= work.ae {
+            continue;
+        }
+        let aa = groups[work.group_idx].aa;
+        let nt_start = (work.reg.ve - work.as_) as usize;
+        if right_batch.push(
+            &work.nt[nt_start..],
+            &aa[work.reg.qe as usize..],
+            &right_opt,
+            work.ss_buf.as_deref().map(|ss| &ss[nt_start..]),
+        ) {
+            right_gpu[idx] = Some(right_batch.params.len() - 1);
+        }
+    }
+    let right_start = std::time::Instant::now();
+    let right_run = right_batch.is_profitable();
+    let right_results = right_batch.run(&right_opt);
+    if gpu_stats {
+        eprintln!(
+            "[gpu] right_ext jobs={} kernel={} time={:.3}s",
+            right_batch.len(),
+            if right_run { "run" } else { "skip" },
+            right_start.elapsed().as_secs_f64()
+        );
+    }
+    works.par_iter_mut().enumerate().for_each(|(idx, work)| {
+        let aa = groups[work.group_idx].aa;
+        let qlen = groups[work.group_idx].qlen;
+        if work.reg.qe >= qlen || work.reg.ve >= work.ae {
+            finish_aligned_reg(
+                opt,
+                tables,
+                qlen,
+                aa,
+                &mut work.reg,
+                &work.nt,
+                work.as_,
+                work.ae,
+                std::mem::take(&mut work.cigar),
+                work.score,
+            );
+            return;
+        }
+        let result = right_gpu[idx].and_then(|pos| {
+            right_results
+                .as_ref()
+                .and_then(|results| results.get(pos).cloned())
+        });
+        let (nt_len, aa_len) = if let Some(result) = result {
+            if result.aa_len < qlen - work.reg.qe
+                && result.nt_len < opt.max_ext
+                && opt.io > opt.io_end
+            {
+                right_extension_cpu(opt, tables, qlen, aa, work).unwrap_or((0, 0))
+            } else {
+                (result.nt_len, result.aa_len)
+            }
+        } else {
+            right_extension_cpu(opt, tables, qlen, aa, work).unwrap_or((0, 0))
+        };
+        apply_right_extension(opt, tables, aa, work, nt_len, aa_len);
+        finish_aligned_reg(
+            opt,
+            tables,
+            qlen,
+            aa,
+            &mut work.reg,
+            &work.nt,
+            work.as_,
+            work.ae,
+            std::mem::take(&mut work.cigar),
+            work.score,
+        );
+    });
+
+    collect_finished_works(works, out)
 }

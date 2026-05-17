@@ -6,10 +6,30 @@
 
 use crate::metal_dp::{DpParams, DpResult};
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SpliceDpParams {
+    pub(crate) nas_offset: u32,
+    pub(crate) aas_offset: u32,
+    pub(crate) donor_offset: u32,
+    pub(crate) acceptor_offset: u32,
+    pub(crate) nl: u32,
+    pub(crate) al: u32,
+    pub(crate) go: i32,
+    pub(crate) ge: i32,
+    pub(crate) io: i32,
+    pub(crate) fs: i32,
+    pub(crate) has_splice: i32,
+    pub(crate) end_bonus: i32,
+    pub(crate) flag: i32,
+    pub(crate) xdrop: i32,
+    pub(crate) ie_coef: f32,
+}
+
 #[cfg(feature = "cuda")]
 #[allow(dead_code)]
 mod imp {
-    use super::{DpParams, DpResult};
+    use super::{DpParams, DpResult, SpliceDpParams};
     use std::{ffi::c_void, ptr::NonNull, sync::Mutex, time::Duration};
 
     static CUDA_LOCK: Mutex<()> = Mutex::new(());
@@ -49,6 +69,20 @@ mod imp {
         ) -> i32;
         fn miniprot_cuda_prepared_batch_run(batch: *mut c_void, results: *mut DpResult) -> i32;
         fn miniprot_cuda_prepared_batch_destroy(batch: *mut c_void);
+        fn miniprot_cuda_batch_dp_splice(
+            nas: *const u8,
+            nas_len: usize,
+            aas: *const u8,
+            aas_len: usize,
+            donor: *const i16,
+            donor_len: usize,
+            acceptor: *const i16,
+            acceptor_len: usize,
+            params: *const SpliceDpParams,
+            n: usize,
+            matrix: *const i8,
+            results: *mut DpResult,
+        ) -> i32;
     }
 
     pub fn available() -> bool {
@@ -77,6 +111,39 @@ mod imp {
                 nas_buf.len(),
                 aas_buf.as_ptr(),
                 aas_buf.len(),
+                params.as_ptr(),
+                params.len(),
+                flat_matrix.as_ptr(),
+                results.as_mut_ptr(),
+            )
+        };
+        (code == 0).then_some(results)
+    }
+
+    pub fn batch_dp_splice_with_matrix(
+        nas_buf: &[u8],
+        aas_buf: &[u8],
+        donor_buf: &[i16],
+        acceptor_buf: &[i16],
+        params: &[SpliceDpParams],
+        matrix: &[[i8; 22]; 22],
+    ) -> Option<Vec<DpResult>> {
+        if params.is_empty() {
+            return Some(Vec::new());
+        }
+        let flat_matrix = matrix.as_flattened();
+        let mut results = vec![DpResult::default(); params.len()];
+        let _guard = CUDA_LOCK.lock().ok()?;
+        let code = unsafe {
+            miniprot_cuda_batch_dp_splice(
+                nas_buf.as_ptr(),
+                nas_buf.len(),
+                aas_buf.as_ptr(),
+                aas_buf.len(),
+                donor_buf.as_ptr(),
+                donor_buf.len(),
+                acceptor_buf.as_ptr(),
+                acceptor_buf.len(),
                 params.as_ptr(),
                 params.len(),
                 flat_matrix.as_ptr(),
@@ -180,7 +247,7 @@ mod imp {
 #[cfg(not(feature = "cuda"))]
 #[allow(dead_code)]
 mod imp {
-    use super::{DpParams, DpResult};
+    use super::{DpParams, DpResult, SpliceDpParams};
 
     pub fn available() -> bool {
         false
@@ -198,6 +265,17 @@ mod imp {
         _nas_buf: &[u8],
         _aas_buf: &[u8],
         _params: &[DpParams],
+        _matrix: &[[i8; 22]; 22],
+    ) -> Option<Vec<DpResult>> {
+        None
+    }
+
+    pub fn batch_dp_splice_with_matrix(
+        _nas_buf: &[u8],
+        _aas_buf: &[u8],
+        _donor_buf: &[i16],
+        _acceptor_buf: &[i16],
+        _params: &[SpliceDpParams],
         _matrix: &[[i8; 22]; 22],
     ) -> Option<Vec<DpResult>> {
         None

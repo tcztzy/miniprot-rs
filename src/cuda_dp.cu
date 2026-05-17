@@ -13,6 +13,12 @@ struct DpResult {
     int32_t score, nt_len, aa_len;
 };
 
+struct SpliceDpParams {
+    uint32_t nas_offset, aas_offset, donor_offset, acceptor_offset, nl, al;
+    int32_t go, ge, io, fs, has_splice, end_bonus, flag, xdrop;
+    float ie_coef;
+};
+
 static constexpr int NEG = -16384;
 static constexpr uint8_t AA_STOP = 20;
 static constexpr int MAX_AL = 128;
@@ -22,6 +28,192 @@ static constexpr int MAX_AL = 128;
 
 __device__ __forceinline__ int imax2(int a, int b) {
     return a > b ? a : b;
+}
+
+__device__ __forceinline__ short to_short(int x) {
+    if (x < -32768) return (short)-32768;
+    if (x > 32767) return (short)32767;
+    return (short)x;
+}
+
+__device__ __forceinline__ int approx_len_penalty(int row_off, float coef) {
+    if (row_off < 2) return 0;
+    const float xf = (float)row_off;
+    int bits = __float_as_int(xf);
+    float log_2 = (float)(((bits >> 23) & 255) - 128);
+    bits &= ~(255 << 23);
+    bits += 127 << 23;
+    const float z = __int_as_float(bits);
+    log_2 += (-0.34484843f * z + 2.02466578f) * z - 0.67487759f;
+    return (int)(coef * log_2 + 0.5f);
+}
+
+__global__ void dp_batch_kernel_splice(
+    const uint8_t* __restrict__ nas_buf,
+    const uint8_t* __restrict__ aas_buf,
+    const int16_t* __restrict__ donor_buf,
+    const int16_t* __restrict__ acceptor_buf,
+    const SpliceDpParams* __restrict__ params,
+    DpResult* __restrict__ results,
+    const int8_t* __restrict__ mat,
+    size_t n
+) {
+    const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    const SpliceDpParams p = params[tid];
+    if (p.nl < 2 || p.al == 0) {
+        results[tid] = DpResult{0, 0, 0};
+        return;
+    }
+    if (p.al > MAX_AL) {
+        results[tid] = DpResult{-1, 0, 0};
+        return;
+    }
+
+    const uint8_t* __restrict__ nas = nas_buf + p.nas_offset;
+    const uint8_t* __restrict__ aas = aas_buf + p.aas_offset;
+    const int16_t* __restrict__ donor = donor_buf + p.donor_offset;
+    const int16_t* __restrict__ acceptor = acceptor_buf + p.acceptor_offset;
+    const int al = (int)p.al;
+    const int nl = (int)p.nl;
+    const bool is_ext = (p.flag & 6) != 0;
+    const bool has_splice = p.has_splice != 0;
+
+    short ha[MAX_AL + 1], hb[MAX_AL + 1], hc[MAX_AL + 1], hd[MAX_AL + 1];
+    short da[MAX_AL + 1], db[MAX_AL + 1], dc[MAX_AL + 1], dd[MAX_AL + 1];
+    short aa0[MAX_AL + 1], aa1[MAX_AL + 1];
+    short bb0[MAX_AL + 1], bb1[MAX_AL + 1];
+    short cc0[MAX_AL + 1], cc1[MAX_AL + 1];
+    short h_best[MAX_AL + 1];
+    short *h3 = ha, *h2 = hb, *h1 = hc, *h0 = hd;
+    short *d3 = da, *d2 = db, *d1 = dc, *d0 = dd;
+    short *a0 = aa0, *a1 = aa1, *b0 = bb0, *b1 = bb1, *c0 = cc0, *c1 = cc1;
+    uint8_t aa_local[MAX_AL];
+    int8_t score_row[MAX_AL];
+    uint8_t score_nt = 255;
+
+    for (int j = 0; j <= al; ++j) {
+        h3[j] = NEG; h2[j] = NEG; h1[j] = NEG;
+        d3[j] = NEG; d2[j] = NEG; d1[j] = NEG;
+        a0[j] = NEG; a1[j] = NEG;
+        b0[j] = NEG; b1[j] = NEG;
+        c0[j] = NEG; c1[j] = NEG;
+        h_best[j] = NEG;
+    }
+    for (int j = 0; j < al; ++j) aa_local[j] = aas[j];
+    h3[0] = 0;
+    h2[0] = (short)-p.fs;
+    h1[0] = (short)-p.fs;
+
+    int best_sc = NEG;
+    int best_sc_log = NEG;
+    int best_i = -1;
+    const int pen_len = al * 3;
+
+    for (int i = 2; i < nl; ++i) {
+        const uint8_t nt_aa = nas[i];
+        const int gei = nt_aa == AA_STOP ? p.fs : p.ge;
+        if (nt_aa != score_nt) {
+            for (int j = 0; j < al; ++j) {
+                score_row[j] = mat[(int)nt_aa * 22 + aa_local[j]];
+            }
+            score_nt = nt_aa;
+        }
+
+        const int dim1 = (int)donor[i - 1];
+        const int di = (int)donor[i];
+        const int dip1 = (int)donor[i + 1];
+        const int ai = (int)acceptor[i];
+        const int aim1 = (int)acceptor[i - 1];
+        const int aim2 = (int)acceptor[i - 2];
+
+        const int od0 = (int)h3[0] - p.go;
+        const int ed0 = (int)d3[0];
+        const int dv0 = imax2(od0, ed0) - gei;
+        d0[0] = to_short(dv0);
+        h0[0] = to_short(imax2(dv0, imax2((int)h1[0] - p.fs, (int)h2[0] - p.fs)));
+        a0[0] = NEG;
+        b0[0] = NEG;
+        c0[0] = NEG;
+
+        int ist = NEG;
+        int row_max = NEG;
+        for (int j = 0; j < al; ++j) {
+            const int col = j + 1;
+            int best = (int)h3[j] + (int)score_row[j];
+
+            const int oi = (int)h0[j] - p.go;
+            const int ti = imax2(oi, ist) - p.ge;
+            ist = ti;
+            if (ti > best) best = ti;
+
+            const int od = (int)h3[col] - p.go;
+            const int td = imax2(od, (int)d3[col]) - gei;
+            d0[col] = to_short(td);
+            if (td > best) best = td;
+
+            if (has_splice) {
+                int t = imax2((int)h1[col] - p.io - dim1, (int)a1[col]);
+                a0[col] = to_short(t);
+                t -= ai;
+                if (t > best) best = t;
+
+                t = imax2((int)h1[j] - p.io - di, (int)b1[col]);
+                b0[col] = to_short(t);
+                t -= aim2;
+                if (t > best) best = t;
+
+                t = imax2((int)h1[j] - p.io - dip1, (int)c1[col]);
+                c0[col] = to_short(t);
+                t -= aim1;
+                if (t > best) best = t;
+
+                t = (int)h1[j] - p.fs; if (t > best) best = t;
+                t = (int)h2[j] - p.fs; if (t > best) best = t;
+                t = (int)h1[col] - p.fs; if (t > best) best = t;
+                t = (int)h2[col] - p.fs; if (t > best) best = t;
+            }
+
+            h0[col] = to_short(best);
+            if (best > row_max) row_max = best;
+        }
+
+        if (is_ext) {
+            const int end_sc = (int)h0[al] + p.end_bonus;
+            const int tmp_sc = imax2(row_max, end_sc);
+            const int len_pen = approx_len_penalty(i - pen_len, p.ie_coef);
+            const int tmp_sc_log = tmp_sc - len_pen;
+            if (tmp_sc_log > best_sc_log) {
+                best_sc = tmp_sc;
+                best_sc_log = tmp_sc_log;
+                best_i = i;
+                for (int j = 0; j <= al; ++j) h_best[j] = h0[j];
+            }
+            if (best_sc_log - tmp_sc_log > p.xdrop) break;
+        }
+
+        short* ht = h3; h3 = h2; h2 = h1; h1 = h0; h0 = ht;
+        short* dt = d3; d3 = d2; d2 = d1; d1 = d0; d0 = dt;
+        short* at = a1; a1 = a0; a0 = at;
+        short* bt = b1; b1 = b0; b0 = bt;
+        short* ct = c1; c1 = c0; c0 = ct;
+    }
+
+    if (is_ext) {
+        int best_aa = 0;
+        for (int j = 0; j < al; ++j) {
+            int sc = (int)h_best[j + 1];
+            if (j == al - 1) sc += p.end_bonus;
+            if (sc == best_sc) {
+                best_aa = j + 1;
+                break;
+            }
+        }
+        results[tid] = DpResult{best_sc, best_i + 1, best_aa};
+    } else {
+        results[tid] = DpResult{(int)h1[al], nl, al};
+    }
 }
 
 __global__ void dp_batch_kernel(
@@ -279,12 +471,18 @@ static bool all_noext(const DpParams* params, size_t n) {
 struct DeviceCache {
     uint8_t* nas = nullptr;
     uint8_t* aas = nullptr;
+    int16_t* donor = nullptr;
+    int16_t* acceptor = nullptr;
     DpParams* params = nullptr;
+    SpliceDpParams* splice_params = nullptr;
     DpResult* results = nullptr;
     int8_t* matrix = nullptr;
     size_t nas_cap = 0;
     size_t aas_cap = 0;
+    size_t donor_cap = 0;
+    size_t acceptor_cap = 0;
     size_t params_cap = 0;
+    size_t splice_params_cap = 0;
     size_t results_cap = 0;
     size_t matrix_cap = 0;
 };
@@ -356,6 +554,56 @@ extern "C" int miniprot_cuda_batch_dp(
         code = (int)cudaMemcpy(results, g_cache.results, n * sizeof(DpResult), cudaMemcpyDeviceToHost);
     }
 
+    return code;
+}
+
+extern "C" int miniprot_cuda_batch_dp_splice(
+    const uint8_t* nas,
+    size_t nas_len,
+    const uint8_t* aas,
+    size_t aas_len,
+    const int16_t* donor,
+    size_t donor_len,
+    const int16_t* acceptor,
+    size_t acceptor_len,
+    const SpliceDpParams* params,
+    size_t n,
+    const int8_t* matrix,
+    DpResult* results
+) {
+    cudaError_t err;
+    err = reserve_device((void**)&g_cache.nas, &g_cache.nas_cap, nas_len); if (err != cudaSuccess) return (int)err;
+    err = reserve_device((void**)&g_cache.aas, &g_cache.aas_cap, aas_len); if (err != cudaSuccess) return (int)err;
+    err = reserve_device((void**)&g_cache.donor, &g_cache.donor_cap, donor_len * sizeof(int16_t)); if (err != cudaSuccess) return (int)err;
+    err = reserve_device((void**)&g_cache.acceptor, &g_cache.acceptor_cap, acceptor_len * sizeof(int16_t)); if (err != cudaSuccess) return (int)err;
+    err = reserve_device((void**)&g_cache.splice_params, &g_cache.splice_params_cap, n * sizeof(SpliceDpParams)); if (err != cudaSuccess) return (int)err;
+    err = reserve_device((void**)&g_cache.results, &g_cache.results_cap, n * sizeof(DpResult)); if (err != cudaSuccess) return (int)err;
+    err = reserve_device((void**)&g_cache.matrix, &g_cache.matrix_cap, 22 * 22); if (err != cudaSuccess) return (int)err;
+
+    err = cudaMemcpy(g_cache.nas, nas, nas_len, cudaMemcpyHostToDevice); if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpy(g_cache.aas, aas, aas_len, cudaMemcpyHostToDevice); if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpy(g_cache.donor, donor, donor_len * sizeof(int16_t), cudaMemcpyHostToDevice); if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpy(g_cache.acceptor, acceptor, acceptor_len * sizeof(int16_t), cudaMemcpyHostToDevice); if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpy(g_cache.splice_params, params, n * sizeof(SpliceDpParams), cudaMemcpyHostToDevice); if (err != cudaSuccess) return (int)err;
+    err = cudaMemcpy(g_cache.matrix, matrix, 22 * 22, cudaMemcpyHostToDevice); if (err != cudaSuccess) return (int)err;
+
+    const int threads = CUDA_THREADS;
+    const int blocks = (int)((n + threads - 1) / threads);
+    dp_batch_kernel_splice<<<blocks, threads>>>(
+        g_cache.nas,
+        g_cache.aas,
+        g_cache.donor,
+        g_cache.acceptor,
+        g_cache.splice_params,
+        g_cache.results,
+        g_cache.matrix,
+        n
+    );
+    int code = (int)cudaGetLastError();
+    if (code == cudaSuccess) code = (int)cudaDeviceSynchronize();
+    if (code == cudaSuccess) {
+        code = (int)cudaMemcpy(results, g_cache.results, n * sizeof(DpResult), cudaMemcpyDeviceToHost);
+    }
     return code;
 }
 

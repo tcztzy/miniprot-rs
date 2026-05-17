@@ -137,13 +137,11 @@ async fn init_gpu() -> Option<GpuState> {
 }
 
 fn ensure_gpu() -> &'static Option<Mutex<GpuState>> {
-    GPU.get_or_init(|| {
-        match pollster::block_on(init_gpu()) {
-            Some(state) => Some(Mutex::new(state)),
-            None => {
-                eprintln!("wgpu: failed to initialize GPU adapter/device");
-                None
-            }
+    GPU.get_or_init(|| match pollster::block_on(init_gpu()) {
+        Some(state) => Some(Mutex::new(state)),
+        None => {
+            eprintln!("wgpu: failed to initialize GPU adapter/device");
+            None
         }
     })
 }
@@ -197,29 +195,25 @@ fn create_storage_buffer<T: bytemuck::Pod>(
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(label),
         contents: bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
     })
 }
 
-fn create_storage_buffer_uninit(
-    device: &wgpu::Device,
-    size: u64,
-    label: &str,
-) -> wgpu::Buffer {
+fn create_storage_buffer_uninit(device: &wgpu::Device, size: u64, label: &str) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
 }
 
 /// Run batched DP on GPU with default BLOSUM62 matrix.
-pub fn batch_dp(
-    nas_buf: &[u8],
-    aas_buf: &[u8],
-    params: &[DpParams],
-) -> Option<Vec<DpResult>> {
+pub fn batch_dp(nas_buf: &[u8], aas_buf: &[u8], params: &[DpParams]) -> Option<Vec<DpResult>> {
     batch_dp_with_matrix(nas_buf, aas_buf, params, &crate::tables::BLOSUM62)
 }
 

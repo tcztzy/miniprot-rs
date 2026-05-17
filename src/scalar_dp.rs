@@ -8,11 +8,11 @@ const NEG_INF: i32 = i32::MIN / 4;
 const AA_AMBI: u8 = 21;
 
 #[derive(Clone)]
-struct PreparedSeq {
-    nas: Vec<u8>,
-    aas: Vec<u8>,
-    donor: Vec<i32>,
-    acceptor: Vec<i32>,
+pub(crate) struct PreparedSeq {
+    pub(crate) nas: Vec<u8>,
+    pub(crate) aas: Vec<u8>,
+    pub(crate) donor: Vec<i32>,
+    pub(crate) acceptor: Vec<i32>,
 }
 
 #[derive(Clone)]
@@ -252,6 +252,19 @@ fn prep_seq_left(ns: &[u8], aa: &[u8], opt: &NsOpt<'_>, ss: Option<&[u8]>) -> Pr
         aas,
         donor,
         acceptor,
+    }
+}
+
+pub(crate) fn prepare_dp_seq(
+    ns: &[u8],
+    aa: &[u8],
+    opt: &NsOpt<'_>,
+    ss: Option<&[u8]>,
+) -> PreparedSeq {
+    if (opt.flag & NS_F_EXT_LEFT) != 0 {
+        prep_seq_left(ns, aa, opt, ss)
+    } else {
+        prep_seq(ns, aa, opt, ss)
     }
 }
 

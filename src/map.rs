@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::Index;
-use crate::align::{align_reg, select_multi_exon};
+use crate::align::{AlignBatch, align_batches, align_regs, select_multi_exon};
 use crate::chain::chain;
 use crate::fastx::{QueryRecord, read_queries_path};
 use crate::format::write_output;
@@ -271,22 +271,14 @@ fn map_queries(
         let mut regs = map_protein(mi, &query.seq, opt)?;
         if (opt.flag & MP_F_NO_ALIGN) == 0 {
             let ext = cal_max_ext(Some(&mi.nt), &regs, 100, opt.max_intron / 2);
-            regs = regs
-                .into_iter()
-                .zip(ext)
-                .filter_map(|(mut reg, ext)| {
-                    align_reg(
-                        mi,
-                        opt,
-                        query.seq.len() as i32,
-                        query.seq.as_bytes(),
-                        &mut reg,
-                        ext.left,
-                        ext.right,
-                    );
-                    reg.extra.is_some().then_some(reg)
-                })
-                .collect();
+            regs = align_regs(
+                mi,
+                opt,
+                query.seq.len() as i32,
+                query.seq.as_bytes(),
+                regs,
+                ext,
+            );
             sort_reg(&mut regs);
             select_multi_exon(&mut regs, opt.io);
             rank_regs(mi, opt, opt.pri_ratio, &mut regs);
@@ -298,6 +290,94 @@ fn map_queries(
     let mut write_regs = |out: &mut String, query: &QueryRecord, regs: &mut Vec<Alignment>| {
         write_query_regs(out, mi, query, regs, opt, &mut next_id);
     };
+
+    if opt.use_gpu && crate::cuda_dp::available() && (opt.flag & MP_F_NO_ALIGN) == 0 {
+        let map_candidates = |query: &QueryRecord| -> crate::Result<Vec<Alignment>> {
+            map_protein(mi, &query.seq, opt)
+        };
+        let process_aligned =
+            |query: &QueryRecord, regs: &mut Vec<Alignment>| -> crate::Result<()> {
+                sort_reg(regs);
+                select_multi_exon(regs, opt.io);
+                rank_regs(mi, opt, opt.pri_ratio, regs);
+                let _ = query;
+                Ok(())
+            };
+
+        if threads <= 1 {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .map_err(|err| {
+                    crate::Error::InvalidArgument(format!(
+                        "failed to build mapping thread pool: {err}"
+                    ))
+                })?;
+            let chunk_size = 1024usize;
+            for chunk in queries.chunks(chunk_size) {
+                let chunk_regs = chunk
+                    .iter()
+                    .map(map_candidates)
+                    .collect::<crate::Result<Vec<_>>>()?;
+                let groups: Vec<_> = chunk
+                    .iter()
+                    .zip(chunk_regs)
+                    .map(|(query, regs)| {
+                        let ext = cal_max_ext(Some(&mi.nt), &regs, 100, opt.max_intron / 2);
+                        AlignBatch {
+                            qlen: query.seq.len() as i32,
+                            aa: query.seq.as_bytes(),
+                            regs,
+                            ext,
+                        }
+                    })
+                    .collect();
+                let mut aligned = pool.install(|| align_batches(mi, opt, groups));
+                for (query, regs) in chunk.iter().zip(aligned.iter_mut()) {
+                    process_aligned(query, regs)?;
+                    write_regs(&mut out, query, regs);
+                }
+            }
+        } else {
+            let threads = threads as usize;
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|err| {
+                    crate::Error::InvalidArgument(format!(
+                        "failed to build mapping thread pool: {err}"
+                    ))
+                })?;
+            let chunk_size = (threads * 1024).clamp(1024, 4096);
+            for chunk in queries.chunks(chunk_size) {
+                let chunk_regs = pool.install(|| {
+                    chunk
+                        .par_iter()
+                        .map(map_candidates)
+                        .collect::<crate::Result<Vec<_>>>()
+                })?;
+                let groups: Vec<_> = chunk
+                    .iter()
+                    .zip(chunk_regs)
+                    .map(|(query, regs)| {
+                        let ext = cal_max_ext(Some(&mi.nt), &regs, 100, opt.max_intron / 2);
+                        AlignBatch {
+                            qlen: query.seq.len() as i32,
+                            aa: query.seq.as_bytes(),
+                            regs,
+                            ext,
+                        }
+                    })
+                    .collect();
+                let mut aligned = pool.install(|| align_batches(mi, opt, groups));
+                for (query, regs) in chunk.iter().zip(aligned.iter_mut()) {
+                    process_aligned(query, regs)?;
+                    write_regs(&mut out, query, regs);
+                }
+            }
+        }
+        return Ok(out);
+    }
 
     if threads <= 1 {
         for query in queries {

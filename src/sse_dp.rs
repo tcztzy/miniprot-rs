@@ -528,9 +528,21 @@ mod x86_64 {
         let mut d2 = vec![neg; slen];
         let mut d3 = vec![neg; slen];
         let has_splice = prep.has_splice;
-        let mut a = if has_splice { vec![neg; slen] } else { Vec::new() };
-        let mut b = if has_splice { vec![neg; slen] } else { Vec::new() };
-        let mut c = if has_splice { vec![neg; slen] } else { Vec::new() };
+        let mut a = if has_splice {
+            vec![neg; slen]
+        } else {
+            Vec::new()
+        };
+        let mut b = if has_splice {
+            vec![neg; slen]
+        } else {
+            Vec::new()
+        };
+        let mut c = if has_splice {
+            vec![neg; slen]
+        } else {
+            Vec::new()
+        };
         let mut tb = if need_trace {
             vec![zero; nl * slen]
         } else {
@@ -615,7 +627,9 @@ mod x86_64 {
                     last_h = h_vec;
                 }
 
-                i_state = unsafe { _mm_max_epi16(_mm_subs_epi16(last_h, goe), _mm_subs_epi16(i_state, ge)) };
+                i_state = unsafe {
+                    _mm_max_epi16(_mm_subs_epi16(last_h, goe), _mm_subs_epi16(i_state, ge))
+                };
                 for _ in 0..LANES {
                     i_state = unsafe { set_lane0(shift_left_2(i_state), NEG) };
                     let mut stopped = false;
@@ -732,7 +746,9 @@ mod x86_64 {
                     last_h = h_vec;
                 }
 
-                i_state = unsafe { _mm_max_epi16(_mm_subs_epi16(last_h, goe), _mm_subs_epi16(i_state, ge)) };
+                i_state = unsafe {
+                    _mm_max_epi16(_mm_subs_epi16(last_h, goe), _mm_subs_epi16(i_state, ge))
+                };
                 for _ in 0..LANES {
                     i_state = unsafe { set_lane0(shift_left_2(i_state), NEG) };
                     let mut stopped = false;
